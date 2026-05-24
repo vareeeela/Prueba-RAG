@@ -26,8 +26,8 @@ COLECCION = "documentos_rag"
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
 
 # ── Modo de inferencia: comenta una línea, descomenta la otra ──
-MODO = "local"   # modelo local via Ollama
-# MODO = "groq"  # API Groq  (requiere GROQ_API_KEY en el entorno)
+# MODO = "local"   # modelo local via Ollama
+MODO = "groq"  # API Groq  (requiere GROQ_API_KEY en el entorno)
 
 # ── Config modelo local (Ollama) ───────────────────────────────
 # MODELO_LLM = "llama3.2"

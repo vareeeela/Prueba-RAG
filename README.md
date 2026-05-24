@@ -84,11 +84,7 @@ Actualiza `MODELO_LLM` en `rag_v2.py` con el nombre del modelo descargado.
 GROQ_API_KEY=tu_clave_aqui
 ```
 
-3. Instala el paquete de Groq:
-
-```bash
-pip install groq
-```
+> El paquete `groq` ya se instala automáticamente con `pip install -r requirements.txt`.
 
 Modelos recomendados (variable `MODELO_GROQ` en `rag_v2.py`):
 
