@@ -7,7 +7,10 @@ import os
 
 import chromadb
 import ollama
+from dotenv import load_dotenv
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+load_dotenv()
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from markitdown import MarkItDown
 from rich.console import Console
@@ -19,14 +22,26 @@ console = Console()
 CARPETA_DOCS = "documentos"
 RUTA_BD = "bd_vectorial"
 COLECCION = "documentos_rag"
-MODELO_LLM = "llama3.2"
-MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
-N_RESULTADOS = 5
-CACHE_HASHES = os.path.join(RUTA_BD, ".doc_hashes.json")
+# MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
+MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
+
+# ── Modo de inferencia: comenta una línea, descomenta la otra ──
+MODO = "local"   # modelo local via Ollama
+# MODO = "groq"  # API Groq  (requiere GROQ_API_KEY en el entorno)
+
+# ── Config modelo local (Ollama) ───────────────────────────────
+# MODELO_LLM = "llama3.2"
+MODELO_LLM = "llama2"
+
+# ── Config Groq ────────────────────────────────────────────────
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")   # o pon tu clave directamente
+MODELO_GROQ = "llama-3.3-70b-versatile"             # otros: mixtral-8x7b-32768, gemma2-9b-it
+N_RESULTADOS = 5 # cantidad de fragmentos a recuperar para contexto
+CACHE_HASHES = os.path.join(RUTA_BD, ".doc_hashes.json") 
 EXTENSIONES = (".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md")
 
 # ── Inicialización única ───────────────────────────────────────
-md_converter = MarkItDown()
+md_converter = MarkItDown() 
 splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 embedding_fn = SentenceTransformerEmbeddingFunction(model_name=MODELO_EMBEDDINGS)
 
@@ -162,13 +177,30 @@ PREGUNTA: {pregunta}
 RESPUESTA:"""
 
     console.print("\n[bold]Respuesta:[/bold] ", end="")
-    stream = ollama.chat(
-        model=MODELO_LLM,
-        messages=[{"role": "user", "content": prompt}],
-        stream=True,
-    )
-    for parte in stream:
-        print(parte["message"]["content"], end="", flush=True)
+
+    if MODO == "local":
+        # ── Ollama (local) ─────────────────────────────────────
+        stream = ollama.chat(
+            model=MODELO_LLM,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        for parte in stream:
+            print(parte["message"]["content"], end="", flush=True)
+
+    else:
+        # ── Groq (API) ─────────────────────────────────────────
+        # Requiere: pip install groq
+        from groq import Groq
+        cliente_groq = Groq(api_key=GROQ_API_KEY)
+        stream = cliente_groq.chat.completions.create(
+            model=MODELO_GROQ,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        for chunk in stream:
+            print(chunk.choices[0].delta.content or "", end="", flush=True)
+
     print()
     console.print(f"\n[dim]Fuentes: {', '.join(docs_unicos)}[/dim]")
     console.print("[dim]" + "─" * 60 + "[/dim]")
