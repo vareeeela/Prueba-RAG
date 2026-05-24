@@ -28,19 +28,19 @@ Sistema de Retrieval-Augmented Generation (RAG). Permite hacer preguntas sobre d
 
 ## Instalación
 
-### 1️⃣ Clonar el repositorio
+### 1. Clonar el repositorio
 
 ```bash
-git clone <tu-repo-url>
-cd tfg-rag
+git clone <https://github.com/vareeeela/Prueba-RAG>
+cd Prueba-RAG
 ```
 
-### 2️⃣ Crear y activar entorno virtual
+### 2. Crear y activar entorno virtual
 
 **En Windows (PowerShell):**
 ```powershell
 python -m venv venv
-.\venv\Scripts\Activate.ps1
+venv\Scripts\Activate
 ```
 
 **En macOS/Linux:**
@@ -49,14 +49,14 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-### 3️⃣ Instalar dependencias
+### 3. Instalar dependencias
 
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4️⃣ Descargar modelo de Ollama
+### 4. Descargar modelo de Ollama
 
 ```bash
 ollama pull llama3.2
@@ -64,7 +64,7 @@ ollama pull llama3.2
 
 > **Nota**: Este comando descarga el modelo (~5GB). Si prefieres un modelo más ligero, usa `ollama pull neural-chat` (~4GB) y modifica la línea del modelo en los scripts.
 
-### 5️⃣ Preparar documentos
+### 5. Preparar documentos
 
 ```bash
 # Crear carpeta documentos (si no existe)
@@ -76,10 +76,10 @@ mkdir documentos
 
 ## Uso del Proyecto
 
-### Opción 1: Chat Interactivo (rag_test.py)
+### Chat Interactivo (rag_v2.py)
 
 ```bash
-python rag_test.py
+python rag_v2.py
 ```
 
 Este script:
@@ -88,39 +88,21 @@ Este script:
 3. Abre un chat interactivo donde puedes hacer preguntas
 4. Escribe `salir` para terminar
 
-### Opción 2: Procesamiento Avanzado (rag_v2.py)
-
-```bash
-python rag_v2.py
-```
-
-Este script utiliza MarkItDown para mejor conversión de documentos y metadatos más detallados.
-
-### Opción 3: Probar Embeddings (test_embeddings.py)
-
-```bash
-python test_embeddings.py
-```
-
-Verifica que los embeddings se generan correctamente (útil para diagnosticar problemas).
-
 ## Estructura
 
 ```
-tfg-rag/
-├── README.md                 
-├── requirements.txt          # Dependencias Python
-├── .gitignore              # Archivos ignorados en Git
-├── rag_test.py            # Script principal - Chat RAG simple
-├── rag_v2.py              # Script avanzado - RAG con MarkItDown
-├── test_embeddings.py     # Test de embeddings
-├── documentos/            # Documentos (PDF, DOCX, etc.)
+Prueba-RAG/
+├── README.md                  # Documentación del proyecto
+├── requirements.txt           # Dependencias Python
+├── .gitignore                 # Archivos ignorados en Git
+├── rag_v2.py                  # Script principal - RAG con MarkItDown
+├── documentos/               # Documentos (PDF, DOCX, etc.)
 │   ├── documento1.pdf
 │   └── documento2.docx
-├── bd_vectorial/          # Base de datos ChromaDB (generada auto)
+├── bd_vectorial/             # Base de datos ChromaDB (generada automáticamente)
 │   ├── chroma.sqlite3
 │   └── [metadatos]
-└── venv/                  # Entorno virtual Python
+└── venv/                      # Entorno virtual Python
 ```
 
 ## Flujo de Trabajo 
@@ -128,7 +110,7 @@ tfg-rag/
 ```
 1. Coloca tus documentos en documentos/
    ↓
-2. Ejecuta: python rag_test.py (o rag_v2.py)
+2. Ejecuta: python rag_v2.py
    ↓
 3. El script convierte documentos → fragmentos → embeddings
    ↓
