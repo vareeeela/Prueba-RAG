@@ -37,6 +37,7 @@ MODO = _cfg["llm"]["modo"]
 MODELO_LLM = _cfg["llm"]["modelo_local"]
 MODELO_GROQ = _cfg["llm"]["modelo_groq"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+MAX_TURNOS_HISTORIAL = _cfg["llm"]["max_turnos_historial"]
 
 # Singletons compartidos
 console = Console()

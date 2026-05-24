@@ -25,3 +25,4 @@ llm:
   modo: "groq"
   modelo_groq: "llama-3.3-70b-versatile"
   modelo_local: "llama3.2"
+  max_turnos_historial: 6
