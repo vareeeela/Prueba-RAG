@@ -1,212 +1,209 @@
-from markitdown import MarkItDown
-import chromadb
-import ollama
+"""
+RAG pipeline: índice persistente + embeddings multilingües + respuesta en streaming.
+"""
+import hashlib
+import json
 import os
 
-# Modelo multilingüe mejorado para búsqueda semántica (mejor soporte para español)
-# Inicializar MarkItDown
+import chromadb
+import ollama
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from markitdown import MarkItDown
+from rich.console import Console
+from rich.panel import Panel
+
+console = Console()
+
+# ── Configuración ─────────────────────────────────────────────
+CARPETA_DOCS = "documentos"
+RUTA_BD = "bd_vectorial"
+COLECCION = "documentos_rag"
+MODELO_LLM = "llama3.2"
+MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
+N_RESULTADOS = 5
+CACHE_HASHES = os.path.join(RUTA_BD, ".doc_hashes.json")
+EXTENSIONES = (".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md")
+
+# ── Inicialización única ───────────────────────────────────────
 md_converter = MarkItDown()
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+embedding_fn = SentenceTransformerEmbeddingFunction(model_name=MODELO_EMBEDDINGS)
 
 
+# ── Helpers internos ───────────────────────────────────────────
 
-# Convertir solo el primer PDF y ver qué sale
-ruta = "documentos/documento3.pdf"
-resultado = md_converter.convert(ruta)
-texto = resultado.text_content
+def _hash_archivo(ruta: str) -> str:
+    h = hashlib.md5()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(65536), b""):
+            h.update(bloque)
+    return h.hexdigest()
 
-print("PRIMEROS 1000 CARACTERES DEL TEXTO CONVERTIDO:")
-print("=" * 60)
-print(texto[:1000])
-print("=" * 60)
-print(f"\nTiene títulos con #: {'#' in texto}")
-print(f"Total de caracteres: {len(texto)}")
 
-# ============================================================
-# PASO 1: CONVERTIR Y LEER DOCUMENTOS
-# ============================================================
+def _cargar_hashes() -> dict:
+    if os.path.exists(CACHE_HASHES):
+        with open(CACHE_HASHES) as f:
+            return json.load(f)
+    return {}
 
-def leer_documento(ruta):
-    """
-    Convierte cualquier formato a Markdown y devuelve el texto.
-    Soporta PDF, DOCX, PPTX, Excel, imágenes...
-    """
-    resultado = md_converter.convert(ruta)
-    return resultado.text_content
 
-def trocear_texto(texto, tamanio=1000, solapamiento=150):
-    chunks = []
-    inicio = 0
-    while inicio < len(texto):
-        fin = inicio + tamanio
-        chunk = texto[inicio:fin]
-        if chunk.strip() and len(chunk) > 50:
-            chunks.append(chunk)
-        inicio += tamanio - solapamiento
-    return chunks
+def _guardar_hashes(hashes: dict) -> None:
+    os.makedirs(RUTA_BD, exist_ok=True)
+    with open(CACHE_HASHES, "w") as f:
+        json.dump(hashes, f)
 
-def cargar_documentos(carpeta):
-    """
-    Lee todos los documentos de la carpeta, los convierte a Markdown
-    y los trocea de forma inteligente.
-    """
-    extensiones = (".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md")
-    archivos = [f for f in os.listdir(carpeta) if f.lower().endswith(extensiones)]
+
+def _obtener_coleccion(cliente: chromadb.PersistentClient) -> chromadb.Collection:
+    """Obtiene o crea la colección. Si el modelo de embeddings cambió, la recrea."""
+    nombres = [c.name for c in cliente.list_collections()]
+    if COLECCION in nombres:
+        col = cliente.get_collection(name=COLECCION, embedding_function=embedding_fn)
+        if col.metadata.get("embedding_model") != MODELO_EMBEDDINGS:
+            console.print("[yellow]Modelo de embeddings actualizado — reindexando...[/yellow]")
+            cliente.delete_collection(COLECCION)
+            if os.path.exists(CACHE_HASHES):
+                os.remove(CACHE_HASHES)
+        else:
+            return col
+    return cliente.create_collection(
+        name=COLECCION,
+        embedding_function=embedding_fn,
+        metadata={"hnsw:space": "cosine", "embedding_model": MODELO_EMBEDDINGS},
+    )
+
+
+# ── Indexación ─────────────────────────────────────────────────
+
+def indexar_documentos(coleccion: chromadb.Collection) -> None:
+    """Indexa solo los documentos nuevos o modificados (detección por hash MD5)."""
+    archivos = [
+        f for f in os.listdir(CARPETA_DOCS)
+        if f.lower().endswith(EXTENSIONES)
+    ]
 
     if not archivos:
-        print("❌ No hay documentos en la carpeta 'documentos'")
-        return [], [], []
+        console.print("[red]No hay documentos en 'documentos/'[/red]")
+        return
 
-    todos_chunks = []
-    todos_metadatos = []
-    todos_ids = []
-    contador = 0
+    hashes_previos = _cargar_hashes()
+    hashes_nuevos = {}
+    cambios = False
 
     for archivo in archivos:
-        ruta = os.path.join(carpeta, archivo)
-        print(f"   📄 Convirtiendo: {archivo}")
+        ruta = os.path.join(CARPETA_DOCS, archivo)
+        hash_actual = _hash_archivo(ruta)
+        hashes_nuevos[archivo] = hash_actual
 
-        try:
-            texto = leer_documento(ruta)
-            chunks = trocear_texto(texto)
-
-            for chunk in chunks:
-                todos_chunks.append(chunk)
-                todos_metadatos.append({"fuente": archivo})
-                todos_ids.append(f"chunk_{contador}")
-                contador += 1
-
-            print(f"      → {len(chunks)} fragmentos extraídos")
-
-        except Exception as e:
-            print(f"      ⚠️ Error procesando {archivo}: {e}")
+        if hashes_previos.get(archivo) == hash_actual:
+            console.print(f"   [dim]Sin cambios: {archivo}[/dim]")
             continue
 
-    return todos_chunks, todos_metadatos, todos_ids
+        console.print(f"   [cyan]Indexando: {archivo}[/cyan]")
+        try:
+            texto = md_converter.convert(ruta).text_content
+            chunks = [c for c in splitter.split_text(texto) if len(c.strip()) > 50]
 
-print("📚 Cargando documentos...")
-chunks, metadatos, ids = cargar_documentos("documentos")
-print(f"\n   → Total: {len(chunks)} fragmentos de {len(set(m['fuente'] for m in metadatos))} documentos")
+            # Eliminar versión anterior del mismo documento si existe
+            try:
+                existentes = coleccion.get(where={"fuente": archivo})
+                if existentes["ids"]:
+                    coleccion.delete(ids=existentes["ids"])
+            except Exception:
+                pass
 
-# ============================================================
-# PASO 2: GUARDAR EN CHROMADB CON METADATOS
-# ============================================================
+            coleccion.add(
+                documents=chunks,
+                metadatas=[{"fuente": archivo}] * len(chunks),
+                ids=[f"{archivo}_{i}" for i in range(len(chunks))],
+            )
+            cambios = True
+            console.print(f"      [green]→ {len(chunks)} fragmentos[/green]")
 
-print("\n🧠 Guardando en base vectorial...")
+        except Exception as e:
+            console.print(f"      [red]Error procesando {archivo}: {e}[/red]")
 
-cliente = chromadb.PersistentClient(path="bd_vectorial")
-
-try:
-    cliente.delete_collection("documentos_sgsi")
-except:
-    pass
-
-coleccion = cliente.create_collection(
-    name="documentos_sgsi",
-    metadata={"hnsw:space": "cosine"}
-)
+    if cambios or hashes_nuevos != hashes_previos:
+        _guardar_hashes(hashes_nuevos)
 
 
-coleccion.add(
-    documents=chunks,
-    metadatas=metadatos,
-    ids=ids
-)
+# ── Recuperación y respuesta ───────────────────────────────────
 
-print(f"   → Guardados correctamente")
-
-# ============================================================
-# PASO 3: BÚSQUEDA CON TRAZABILIDAD
-# ============================================================
-
-def buscar_chunks_relevantes(pregunta, n_resultados=5):
-    resultados = coleccion.query(
+def _buscar_contexto(coleccion: chromadb.Collection, pregunta: str):
+    res = coleccion.query(
         query_texts=[pregunta],
-        n_results=n_resultados,
-        include=["documents", "metadatas", "distances"]
+        n_results=N_RESULTADOS,
+        include=["documents", "metadatas", "distances"],
     )
-    chunks_encontrados = resultados["documents"][0]
-    fuentes = [m["fuente"] for m in resultados["metadatas"][0]]
-    distancias = resultados["distances"][0]
-    return chunks_encontrados, fuentes, distancias
+    docs = res["documents"][0]
+    fuentes = [m["fuente"] for m in res["metadatas"][0]]
+    return docs, fuentes
 
-# ============================================================
-# PASO 4: GENERAR RESPUESTA CON TRAZABILIDAD
-# ============================================================
 
-def preguntar(pregunta):
-    chunks_relevantes, fuentes, distancias = buscar_chunks_relevantes(pregunta)
-    
-    # Construir contexto indicando de qué documento viene cada fragmento
-    contexto_partes = []
-    for i, (chunk, fuente, distancia) in enumerate(zip(chunks_relevantes, fuentes, distancias)):
-        contexto_partes.append(f"[FRAGMENTO {i+1} - Fuente: {fuente}]\n{chunk}\n")
-    contexto = "\n---\n".join(contexto_partes)
-    
-    # Documentos únicos encontrados
-    docs_unicos = list(set(fuentes))
-    docs_str = ", ".join(docs_unicos)
-    
-    prompt = f"""Eres un asistente especializado en historia de España.
+def preguntar(coleccion: chromadb.Collection, pregunta: str) -> None:
+    chunks, fuentes = _buscar_contexto(coleccion, pregunta)
+    docs_unicos = sorted(set(fuentes))
 
-Basa tu respuesta ÚNICAMENTE en el contexto proporcionado a continuación. 
-Responde de forma clara y directa, citando los DOCUMENTOS de los que extraes la información (no fragmentos).
-Si NO encuentras la información en el contexto, responde: "No dispongo de información suficiente en la documentación para responder esta consulta."
+    contexto = "\n---\n".join(
+        f"[Fragmento {i + 1} · {fuente}]\n{chunk}"
+        for i, (chunk, fuente) in enumerate(zip(chunks, fuentes))
+    )
 
-CONTEXTO (de los documentos: {docs_str}):
+    prompt = f"""Eres un asistente experto. Responde ÚNICAMENTE con la información del contexto proporcionado.
+Cita los documentos de los que extraes la información.
+Si la respuesta no está en el contexto, di exactamente:
+"No dispongo de información suficiente en la documentación para responder esta consulta."
+
+CONTEXTO (fuentes: {', '.join(docs_unicos)}):
 {contexto}
 
-PREGUNTA:
-{pregunta}
+PREGUNTA: {pregunta}
 
-RESPUESTA (cita los documentos de origen, no los fragmentos):"""
+RESPUESTA:"""
 
-    respuesta = ollama.chat(
-        model="llama3.2",
-        messages=[{"role": "user", "content": prompt}]
+    console.print("\n[bold]Respuesta:[/bold] ", end="")
+    stream = ollama.chat(
+        model=MODELO_LLM,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
     )
-    
-    return respuesta["message"]["content"], docs_unicos, chunks_relevantes
-
-# DIAGNÓSTICO - quitar cuando funcione
-print("\n🔬 TEST DE RECUPERACIÓN:")
-chunks_test, fuentes_test, distancias_test = buscar_chunks_relevantes("cuándo murió enrique IV")
-for i, (chunk, fuente, distancia) in enumerate(zip(chunks_test, fuentes_test, distancias_test)):
-    print(f"\n--- Fragmento {i+1} (distancia: {distancia:.3f}) ---")
-    print(f"Fuente: {fuente}")
-    print(f"Texto: {chunk[:200]}...")
-
-print("\n🔬 BÚSQUEDA DIRECTA DE 'Enrique':")
-todos = coleccion.get(include=["documents", "metadatas"])
-for doc, meta in zip(todos["documents"], todos["metadatas"]):
-    if "nrique IV" in doc:
-        print(f"\nFuente: {meta['fuente']}")
-        print(f"Texto: {doc[:300]}")
-        print("---")
-# ============================================================
-# PASO 5: CHAT INTERACTIVO
-# ============================================================
-
-print("\n Sistema listo. Escribe 'salir' para terminar.\n")
-print("=" * 60)
-
-while True:
-    pregunta = input("\n🔍 Tu pregunta: ").strip()
-    
-    if pregunta.lower() == "salir":
-        print("Saliendo...")
-        break
-    
-    if not pregunta:
-        continue
-    
-    print("\n⏳ Buscando en documentación...")
-    respuesta, docs_consultados, chunks = preguntar(pregunta)
-    
-    print(f"\n💬 Respuesta:\n{respuesta}")
-    
-    # Mostrar documentos únicos consultados
-    print(f"\n📎 Documentos consultados: {', '.join(docs_consultados)}")
-    print("-" * 60)
+    for parte in stream:
+        print(parte["message"]["content"], end="", flush=True)
+    print()
+    console.print(f"\n[dim]Fuentes: {', '.join(docs_unicos)}[/dim]")
+    console.print("[dim]" + "─" * 60 + "[/dim]")
 
 
+# ── Main ───────────────────────────────────────────────────────
 
+def main() -> None:
+    console.print(Panel("[bold cyan]Sistema RAG[/bold cyan]", expand=False))
+
+    cliente = chromadb.PersistentClient(path=RUTA_BD)
+    coleccion = _obtener_coleccion(cliente)
+
+    console.print("\n[bold]Verificando documentos...[/bold]")
+    indexar_documentos(coleccion)
+    console.print(f"\n[green]Base de conocimiento lista: {coleccion.count()} fragmentos[/green]\n")
+    console.print("Escribe [bold]'salir'[/bold] para terminar.\n" + "─" * 60)
+
+    while True:
+        try:
+            pregunta = input("\nPregunta: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Saliendo...[/yellow]")
+            break
+
+        if pregunta.lower() == "salir":
+            console.print("[yellow]Saliendo...[/yellow]")
+            break
+
+        if not pregunta:
+            continue
+
+        console.print("[dim]Buscando en documentación...[/dim]")
+        preguntar(coleccion, pregunta)
+
+
+if __name__ == "__main__":
+    main()
