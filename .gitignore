@@ -1,0 +1,14 @@
+# Entorno virtual
+venv/
+.venv/
+# Documentos
+documentos/
+data/
+#Bases de datos vectoriales
+bd_vectorial/
+chroma/
+
+.env
+__pycache__/
+*.pyc
+.vscode/
