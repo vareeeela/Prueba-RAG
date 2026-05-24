@@ -1,11 +1,11 @@
 import os
 
 import yaml
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from markitdown import MarkItDown
 from rich.console import Console
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -28,6 +28,8 @@ N_RESULTADOS = _cfg["retrieval"]["n_resultados"]
 CHUNK_SIZE = _cfg["retrieval"]["chunk_size"]
 CHUNK_OVERLAP = _cfg["retrieval"]["chunk_overlap"]
 MIN_CHUNK_LEN = _cfg["retrieval"]["min_chunk_len"]
+SIMILARITY_THRESHOLD = _cfg["retrieval"]["similarity_threshold"]
+N_QUERY_VARIANTS = _cfg["retrieval"]["n_query_variants"]
 EXTENSIONES = tuple(_cfg["retrieval"]["extensiones"])
 
 # LLM
@@ -40,4 +42,24 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 console = Console()
 md_converter = MarkItDown()
 splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-embedding_fn = SentenceTransformerEmbeddingFunction(model_name=MODELO_EMBEDDINGS)
+
+_USE_E5_PREFIX = "e5" in MODELO_EMBEDDINGS.lower()
+_st_model = SentenceTransformer(MODELO_EMBEDDINGS)
+
+
+class _E5EmbeddingFunction:
+    """Embedding function con soporte de prefijos query/passage para modelos E5."""
+
+    def name(self) -> str:
+        return MODELO_EMBEDDINGS
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        texts = [f"passage: {t}" for t in input] if _USE_E5_PREFIX else input
+        return _st_model.encode(texts, normalize_embeddings=True).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        text = f"query: {text}" if _USE_E5_PREFIX else text
+        return _st_model.encode(text, normalize_embeddings=True).tolist()
+
+
+embedding_fn = _E5EmbeddingFunction()

@@ -6,16 +6,17 @@ Sistema de Retrieval-Augmented Generation (RAG). Permite hacer preguntas sobre d
 
 - **Búsqueda semántica** de fragmentos de documentos
 - **Base de datos vectorial** con ChromaDB
-- **Embeddings multilingües** con sentence-transformers
+- **Embeddings multilingües** con sentence-transformers (`paraphrase-multilingual-MiniLM-L12-v2`)
 - **Dos modos de inferencia**: LLM local via Ollama o API de Groq
 - **Soporte para múltiples formatos**: PDF, Markdown, DOCX, PPTX, XLSX, TXT (via MarkItDown)
+- **Configuración centralizada** en `config.yaml`, sin tocar código
 - **Chat interactivo** en terminal
 
 ## Requisitos Previos
 
 ### Software necesario:
 
-1. **Python 3.8+** - Descargar desde [python.org](https://www.python.org/downloads/)
+1. **Python 3.11+** - Descargar desde [python.org](https://www.python.org/downloads/)
 2. **Ollama** *(solo si usas modo local)* - Descargar desde [ollama.ai](https://ollama.ai)
    - Asegúrate de que esté ejecutándose antes de lanzar el script (`ollama serve`)
 
@@ -51,27 +52,30 @@ pip install -r requirements.txt
 
 ### 4. Elegir modo de inferencia
 
-El modo se controla con la variable `MODO` en `rag_v2.py`:
+El modo se controla en `config.yaml`:
 
-```python
-MODO = "local"   # modelo local via Ollama
-# MODO = "groq"  # API Groq
+```yaml
+llm:
+  modo: "local"   # modelo local via Ollama
+  # modo: "groq"  # API Groq
 ```
-
-Comenta una línea y descomenta la otra para cambiar de modo.
 
 ---
 
 #### Modo local (Ollama)
 
-Descarga el modelo que quieras usar:
+Descarga el modelo configurado en `config.yaml`:
 
 ```bash
-ollama pull llama2         # equilibrio calidad/velocidad
-ollama pull llama3.2       # más potente, más lento
+ollama pull llama3.2
 ```
 
-Actualiza `MODELO_LLM` en `rag_v2.py` con el nombre del modelo descargado.
+Para cambiar de modelo, edita `config.yaml`:
+
+```yaml
+llm:
+  modelo_local: "llama3.2"   # o llama3.1:8b, qwen2.5:7b, etc.
+```
 
 ---
 
@@ -84,9 +88,14 @@ Actualiza `MODELO_LLM` en `rag_v2.py` con el nombre del modelo descargado.
 GROQ_API_KEY=tu_clave_aqui
 ```
 
-> El paquete `groq` ya se instala automáticamente con `pip install -r requirements.txt`.
+Para cambiar de modelo, edita `config.yaml`:
 
-Modelos recomendados (variable `MODELO_GROQ` en `rag_v2.py`):
+```yaml
+llm:
+  modelo_groq: "llama-3.3-70b-versatile"
+```
+
+Modelos recomendados:
 
 | Modelo | Contexto | Cuándo usarlo |
 |---|---|---|
@@ -98,71 +107,79 @@ Modelos recomendados (variable `MODELO_GROQ` en `rag_v2.py`):
 
 #### Modelo de embeddings
 
-Independiente del modo LLM, configurable con `MODELO_EMBEDDINGS`:
+Configurable en `config.yaml`:
 
-- `all-MiniLM-L6-v2` — rápido (por defecto)
-- `all-MiniLM-L12-v2` — mayor calidad
-- `paraphrase-multilingual-MiniLM-L12-v2` — mejor cobertura multilingüe
+```yaml
+embeddings:
+  modelo: "paraphrase-multilingual-MiniLM-L12-v2"  # multilingüe (por defecto)
+```
+
+Opciones:
+
+| Modelo | Idiomas | Notas |
+|---|---|---|
+| `paraphrase-multilingual-MiniLM-L12-v2` | Multilingüe | Por defecto; equilibrio calidad/velocidad |
+| `intfloat/multilingual-e5-base` | Multilingüe | Mayor rendimiento; requiere prefijos `query:`/`passage:` |
+| `all-MiniLM-L6-v2` | Inglés | Más rápido; no recomendado para español |
+
+> Al cambiar el modelo de embeddings, la base de datos se reindexará automáticamente en la siguiente ejecución.
 
 ### 5. Preparar documentos
 
 ```bash
-# Crear carpeta documentos (si no existe)
 mkdir documentos
-
-# Copiar tus archivos PDF, DOCX, Markdown, etc. aquí
-# Ejemplo: documentos/documento1.pdf
+# Copia tus archivos PDF, DOCX, Markdown, etc. aquí
 ```
 
 ## Uso del Proyecto
-
-### Chat Interactivo (rag_v2.py)
 
 ```bash
 python rag_v2.py
 ```
 
-Este script:
-1. Lee documentos desde la carpeta `documentos/`
-2. Genera embeddings y los almacena en ChromaDB
-3. Abre un chat interactivo donde puedes hacer preguntas
+El sistema:
+1. Lee documentos desde `documentos/`
+2. Indexa solo los nuevos o modificados (caché por hash MD5)
+3. Abre un chat interactivo para hacer preguntas
 4. Escribe `salir` para terminar
 
 ## Estructura
 
 ```
-Prueba-RAG/
-├── README.md                  # Documentación del proyecto
-├── requirements.txt           # Dependencias Python
-├── .gitignore                 # Archivos ignorados en Git
+tfg-rag/
+├── README.md
+├── requirements.txt
+├── config.yaml                # Parámetros de configuración
 ├── .env                       # API keys (no se sube a Git)
-├── rag_v2.py                  # Script principal
-├── documentos/                # Documentos (PDF, DOCX, etc.)
-│   ├── documento1.pdf
-│   └── documento2.docx
-├── bd_vectorial/              # Base de datos ChromaDB (generada automáticamente)
-│   ├── chroma.sqlite3
-│   └── [metadatos]
-└── venv/                      # Entorno virtual Python
+├── .gitignore
+├── rag_v2.py                  # Punto de entrada
+├── src/
+│   ├── config.py              # Carga config.yaml, expone constantes y singletons
+│   ├── indexer.py             # Carga, chunking, hashing e indexación
+│   ├── retriever.py           # Búsqueda semántica en ChromaDB
+│   ├── generator.py           # Construcción del prompt y llamada al LLM
+│   └── main.py                # Bucle de conversación
+├── documentos/                # Documentos a indexar (PDF, DOCX, etc.)
+└── bd_vectorial/              # Base de datos ChromaDB (generada automáticamente)
 ```
 
-## Flujo de Trabajo 
+## Flujo de Trabajo
 
 ```
 1. Coloca tus documentos en documentos/
-   ↓
+
 2. Ejecuta: python rag_v2.py
-   ↓
-3. El script convierte documentos → fragmentos → embeddings
-   ↓
+
+3. El sistema convierte documentos → fragmentos → embeddings
+
 4. ChromaDB almacena los embeddings en bd_vectorial/
-   ↓
+
 5. Chat: Escribe preguntas y obtén respuestas basadas en tus documentos
-   ↓
+
 6. Escribe "salir" para terminar
 ```
 
-## Recursos 
+## Recursos
 
 - [ChromaDB Documentation](https://docs.trychroma.com/)
 - [Ollama Models](https://ollama.ai)
