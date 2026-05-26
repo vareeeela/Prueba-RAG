@@ -8,7 +8,7 @@ import chromadb
 import streamlit as st
 
 from src.config import RUTA_BD
-from src.generator import es_inyeccion_prompt, etiqueta_ubicacion, generar_respuesta, resumen_fuentes
+from src.generator import es_inyeccion_prompt, generar_respuesta
 from src.indexer import indexar_documentos, obtener_coleccion
 from src.retriever import buscar_contexto
 
@@ -102,6 +102,42 @@ migrar_historial_legacy()
 st.set_page_config(page_title="lucIA", page_icon="👻", layout="centered")
 st.title("lucIA ฅᨐฅ")
 
+st.markdown("""
+<style>
+/* Conversaciones de la sidebar como ítems de nav */
+section[data-testid="stSidebar"] .stButton > button {
+    border: none !important;
+    background: transparent !important;
+    text-align: start !important;
+    justify-content: flex-start !important;
+    padding: 0.3rem 0.5rem !important;
+    border-radius: 6px !important;
+    font-size: 0.85rem !important;
+    color: inherit !important;
+    transition: background 0.15s;
+}
+section[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(128,128,128,0.12) !important;
+}
+/* Botón de nueva conversación */
+section[data-testid="stSidebar"] > div > div:first-child .stButton > button {
+    background: rgba(128,128,128,0.08) !important;
+    font-weight: 500 !important;
+    margin-block-end: 0.25rem !important;
+}
+/* Botón de borrar: más pequeño y sutil */
+section[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button {
+    color: rgba(128,128,128,0.6) !important;
+    font-size: 0.8rem !important;
+    padding: 0.3rem 0.2rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button:hover {
+    color: #e05c5c !important;
+    background: rgba(224,92,92,0.08) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 @st.cache_resource(show_spinner="Cargando base de conocimiento...")
 def cargar_sistema() -> chromadb.Collection:
@@ -156,7 +192,19 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    st.caption(f"{coleccion.count()} fragmentos indexados")
+
+
+_PATRON_FUENTE = re.compile(r'\n*FUENTE:\s*(.+)$', re.MULTILINE)
+
+
+def _extraer_fuente(texto: str) -> tuple[str, str]:
+    """Separa la línea FUENTE del cuerpo. Devuelve (cuerpo, fuente)."""
+    m = _PATRON_FUENTE.search(texto)
+    if not m:
+        return texto.strip(), ""
+    fuente = m.group(1).strip()
+    cuerpo = texto[:m.start()].strip()
+    return cuerpo, fuente
 
 
 # ── Mostrar historial ──────────────────────────────────────────────────────
@@ -164,15 +212,8 @@ with st.sidebar:
 for msg in st.session_state.mensajes:
     with st.chat_message(msg["rol"]):
         st.write(msg["contenido"])
-        if msg.get("fuentes"):
-            st.caption(f"**Fuentes:** {msg['fuentes']}")
-        if msg.get("chunks"):
-            with st.expander(f"Ver {len(msg['chunks'])} fragmentos usados"):
-                for i, (chunk, meta) in enumerate(zip(msg["chunks"], msg["metas"]), 1):
-                    st.markdown(f"**[{i}] {etiqueta_ubicacion(meta)}**")
-                    st.text(chunk)
-                    if i < len(msg["chunks"]):
-                        st.divider()
+        if msg.get("fuente_citada"):
+            st.caption(msg["fuente_citada"])
 
 
 # ── Input ──────────────────────────────────────────────────────────────────
@@ -188,52 +229,38 @@ if pregunta := st.chat_input("Escribe tu pregunta..."):
 
     st.session_state.mensajes.append({"rol": "user", "contenido": pregunta})
 
+    fuente_citada = ""
     with st.chat_message("assistant"):
         if es_saludo(pregunta):
             respuesta = "¡Hola! Soy lucIA, un asistente basado en tu documentación. ¿En qué puedo ayudarte?"
             st.write(respuesta)
-            fuentes_str = ""
-            chunks_guardados: list = []
-            metas_guardadas: list = []
         elif es_inyeccion_prompt(pregunta):
             respuesta = (
                 "Esta solicitud parece intentar modificar mi comportamiento o rol. "
-                "Solo puedo responder preguntas sobre los documentos disponibles."
+                "Sólo puedo responder preguntas sobre los documentos disponibles."
             )
             st.write(respuesta)
-            fuentes_str = ""
-            chunks_guardados = []
-            metas_guardadas = []
         else:
             with st.spinner("Buscando en documentación..."):
                 chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo)
 
             if not chunks:
-                respuesta = "No encuentro fragmentos relevantes en la documentación. ¿Podrías reformular la pregunta o ser más específico?"
+                respuesta = "Esta consulta no parece estar relacionada con el contenido de los documentos disponibles en esta herramienta."
                 st.write(respuesta)
-                fuentes_str = ""
-                chunks_guardados = []
-                metas_guardadas = []
             else:
-                respuesta = st.write_stream(
-                    generar_respuesta(chunks, metas, pregunta, historial=historial_previo)
-                )
-                fuentes_str = resumen_fuentes(metas)
-                st.caption(f"**Fuentes:** {fuentes_str}")
-                with st.expander(f"Ver {len(chunks)} fragmentos usados"):
-                    for i, (chunk, meta) in enumerate(zip(chunks, metas), 1):
-                        st.markdown(f"**[{i}] {etiqueta_ubicacion(meta)}**")
-                        st.text(chunk)
-                        if i < len(chunks):
-                            st.divider()
-                chunks_guardados = chunks
-                metas_guardadas = metas
+                placeholder = st.empty()
+                texto_completo = ""
+                for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo):
+                    texto_completo += token
+                    cuerpo, _ = _extraer_fuente(texto_completo)
+                    placeholder.markdown(cuerpo)
+                respuesta, fuente_citada = _extraer_fuente(texto_completo)
+                if fuente_citada:
+                    st.caption(fuente_citada)
 
     st.session_state.mensajes.append({
         "rol": "assistant",
         "contenido": respuesta,
-        "fuentes": fuentes_str,
-        "chunks": chunks_guardados,
-        "metas": metas_guardadas,
+        "fuente_citada": fuente_citada,
     })
     guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)

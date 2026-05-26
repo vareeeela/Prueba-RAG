@@ -4,7 +4,6 @@ import os
 import re
 
 import chromadb
-import pdfplumber
 
 from .config import (
     CACHE_HASHES, CARPETA_DOCS, COLECCION, EXTENSIONES,
@@ -34,27 +33,18 @@ def _guardar_hashes(hashes: dict) -> None:
         json.dump(hashes, f)
 
 
-def _extraer_chunks_pdf(ruta: str, archivo: str) -> list[tuple[str, dict]]:
-    """Extrae chunks de un PDF con número de página en los metadatos."""
-    resultado = []
-    with pdfplumber.open(ruta) as pdf:
-        for num_pagina, pagina in enumerate(pdf.pages, start=1):
-            texto = pagina.extract_text() or ""
-            if not texto.strip():
-                continue
-            for chunk in splitter.split_text(texto):
-                if len(chunk.strip()) >= MIN_CHUNK_LEN:
-                    resultado.append((chunk, {"fuente": archivo, "pagina": num_pagina}))
-    return resultado
+_HEADING_RE = re.compile(
+    r"^(#{1,6}\s+\S.+|\d+(?:\.\d+)*\.?\s+[A-ZÁÉÍÓÚÜÑA-Za-z].{1,79})$",
+    re.MULTILINE,
+)
 
 
-def _extraer_chunks_texto(ruta: str, archivo: str) -> list[tuple[str, dict]]:
-    """Extrae chunks de formatos no-PDF con sección más cercana en los metadatos."""
-    texto = md_converter.convert(ruta).text_content
-    heading_re = re.compile(r"^#{1,6}\s+(.+)", re.MULTILINE)
+def _limpiar_titulo(titulo: str) -> str:
+    return re.sub(r'^#+\s+', '', titulo).strip()
 
-    # Dividir el texto en secciones según los encabezados
-    matches = list(heading_re.finditer(texto))
+
+def _chunksificar_por_secciones(texto: str, archivo: str) -> list[tuple[str, dict]]:
+    matches = list(_HEADING_RE.finditer(texto))
     secciones: list[tuple[str | None, str]] = []
 
     if not matches:
@@ -64,7 +54,7 @@ def _extraer_chunks_texto(ruta: str, archivo: str) -> list[tuple[str, dict]]:
             secciones.append((None, texto[: matches[0].start()]))
         for i, m in enumerate(matches):
             fin = matches[i + 1].start() if i + 1 < len(matches) else len(texto)
-            secciones.append((m.group(1).strip(), texto[m.end(): fin]))
+            secciones.append((_limpiar_titulo(m.group(1)), texto[m.end(): fin]))
 
     resultado = []
     for heading, contenido in secciones:
@@ -75,6 +65,11 @@ def _extraer_chunks_texto(ruta: str, archivo: str) -> list[tuple[str, dict]]:
                     meta["seccion"] = heading
                 resultado.append((chunk, meta))
     return resultado
+
+
+def _extraer_chunks(ruta: str, archivo: str) -> list[tuple[str, dict]]:
+    texto = md_converter.convert(ruta).text_content
+    return _chunksificar_por_secciones(texto, archivo)
 
 
 def obtener_coleccion(cliente: chromadb.PersistentClient) -> chromadb.Collection:
@@ -123,10 +118,7 @@ def indexar_documentos(coleccion: chromadb.Collection) -> None:
 
         console.print(f"   [cyan]Indexando: {archivo}[/cyan]")
         try:
-            if archivo.lower().endswith(".pdf"):
-                chunks_con_meta = _extraer_chunks_pdf(ruta, archivo)
-            else:
-                chunks_con_meta = _extraer_chunks_texto(ruta, archivo)
+            chunks_con_meta = _extraer_chunks(ruta, archivo)
 
             try:
                 existentes = coleccion.get(where={"fuente": archivo})
