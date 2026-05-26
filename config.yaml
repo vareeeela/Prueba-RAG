@@ -28,4 +28,3 @@ llm:
   max_turnos_historial: 6
   temperature: 0.2
   max_tokens: 1024
-  top_p: 0.9

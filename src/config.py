@@ -40,7 +40,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MAX_TURNOS_HISTORIAL = _cfg["llm"]["max_turnos_historial"]
 TEMPERATURE = _cfg["llm"]["temperature"]
 MAX_TOKENS = _cfg["llm"]["max_tokens"]
-TOP_P = _cfg["llm"]["top_p"]
 
 # Singletons compartidos
 console = Console()

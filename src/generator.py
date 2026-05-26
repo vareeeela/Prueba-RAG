@@ -5,10 +5,11 @@ import chromadb
 
 from .config import (
     GROQ_API_KEY, MAX_TOKENS, MAX_TURNOS_HISTORIAL,
-    MODO, MODELO_GROQ, MODELO_LLM, TEMPERATURE, TOP_P, console,
+    MODO, MODELO_GROQ, MODELO_LLM, TEMPERATURE, console,
 )
 from .retriever import buscar_contexto
 
+# Esto se usa para detectar intentos comunes de inyección de prompt o cambio de rol.
 _PATRON_INYECCION = re.compile(
     r"olvida\s+(tus\s+)?(instrucciones|reglas|contexto|rol|restricciones|sistema)"
     r"|ignora\s+(tus\s+)?(instrucciones|reglas|restricciones|sistema)"
@@ -104,7 +105,12 @@ def generar_respuesta(
 
     if MODO == "local":
         import ollama
-        stream = ollama.chat(model=MODELO_LLM, messages=mensajes, stream=True)
+        stream = ollama.chat(
+            model=MODELO_LLM,
+            messages=mensajes,
+            stream=True,
+            options={"temperature": TEMPERATURE, "num_predict": MAX_TOKENS},
+        )
         for parte in stream:
             yield parte["message"]["content"]
     else:
@@ -113,6 +119,8 @@ def generar_respuesta(
             model=MODELO_GROQ,
             messages=mensajes,
             stream=True,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
         )
         for chunk in stream:
             yield chunk.choices[0].delta.content or ""
