@@ -7,12 +7,12 @@ embeddings:
   modelo: "intfloat/multilingual-e5-large"
 
 retrieval:
-  n_resultados: 5
-  chunk_size: 800
-  chunk_overlap: 150
-  min_chunk_len: 50
-  similarity_threshold: 0.5
-  n_query_variants: 3
+  n_resultados: 4
+  chunk_size: 1200
+  chunk_overlap: 200
+  min_chunk_len: 80
+  similarity_threshold: 0.45
+  n_query_variants: 2
   extensiones:
     - ".pdf"
     - ".docx"
@@ -27,4 +27,4 @@ llm:
   modelo_local: "llama3.2"
   max_turnos_historial: 6
   temperature: 0.2
-  max_tokens: 1024
+  max_tokens: 600

@@ -33,17 +33,77 @@ def _guardar_hashes(hashes: dict) -> None:
         json.dump(hashes, f)
 
 
+# Headings: markdown, numeración ISO (5.1, 5.1.1, A.1), numeración española (1. Objeto)
 _HEADING_RE = re.compile(
-    r"^(#{1,6}\s+\S.+|\d+(?:\.\d+)*\.?\s+[A-ZÁÉÍÓÚÜÑA-Za-z].{1,79})$",
+    r"^("
+    r"#{1,6}\s+\S.+"
+    r"|(?:[A-Z]\.)?(?:\d+\.)+\d*\.?\s+[A-ZÁÉÍÓÚÜÑa-záéíóúüñ].{0,120}"
+    r"|\d+\.\s+[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñA-ZÁÉÍÓÚÜÑ].{0,80}"
+    r")$",
     re.MULTILINE,
 )
 
+_CLAUSULA_RE = re.compile(r"^(?:[A-Z]\.)?(\d+(?:\.\d+)*)")
+
+# Línea que es solo número de sección (p.ej. "5.27.1" o "A.2")
+_LINEA_SOLO_NUM_RE = re.compile(r"^[A-Z]?\.?\d[\d\.]*\s*$")
+
+# Frases de boilerplate legal/copyright en normas ISO
+_BOILERPLATE = (
+    "ISO copyright",
+    "without permission in writing",
+    "All rights reserved",
+    "reproduced or utilized",
+    "Ch. de Blandonnet",
+    "CP 401",
+    "Vernier, Geneva",
+    "www.iso.org",
+)
+
+
+def _es_chunk_valido(chunk: str) -> bool:
+    """Descarta chunks de tabla de contenidos, copyright y listas de números."""
+    lineas = [l for l in chunk.splitlines() if l.strip()]
+    if not lineas:
+        return False
+    # Boilerplate legal
+    if any(trigger in chunk for trigger in _BOILERPLATE):
+        return False
+    # Tabla de contenidos: >45% de líneas son solo números/cláusulas
+    n_toc = sum(1 for l in lineas if _LINEA_SOLO_NUM_RE.match(l.strip()))
+    if len(lineas) >= 5 and n_toc / len(lineas) > 0.45:
+        return False
+    # Líneas muy cortas en promedio (índice, TOC esparso)
+    avg = sum(len(l) for l in lineas) / len(lineas)
+    if avg < 12 and len(lineas) > 8:
+        return False
+    # Chunk que es solo un título/heading sin cuerpo (≤ 2 líneas, < 120 chars total)
+    if len(lineas) <= 2 and len(chunk.strip()) < 120:
+        return False
+    return True
+
 
 def _limpiar_titulo(titulo: str) -> str:
-    return re.sub(r'^#+\s+', '', titulo).strip()
+    return re.sub(r"^#+\s+", "", titulo).strip()
 
 
-def _chunksificar_por_secciones(texto: str, archivo: str) -> list[tuple[str, dict]]:
+def _tipo_documento(archivo: str) -> str:
+    n = archivo.lower()
+    if "27001" in n or "27002" in n:
+        return "norma_iso"
+    if re.match(r"pol[_\-]", n) or "politic" in n:
+        return "politica"
+    if re.match(r"proc[_\-]", n) or "procedimiento" in n:
+        return "procedimiento"
+    return "documento_interno"
+
+
+def _extraer_clausula(heading: str) -> str | None:
+    m = _CLAUSULA_RE.match(heading.strip())
+    return m.group(1) if m else None
+
+
+def _chunksificar_por_secciones(texto: str, archivo: str, tipo_doc: str) -> list[tuple[str, dict]]:
     matches = list(_HEADING_RE.finditer(texto))
     secciones: list[tuple[str | None, str]] = []
 
@@ -59,17 +119,23 @@ def _chunksificar_por_secciones(texto: str, archivo: str) -> list[tuple[str, dic
     resultado = []
     for heading, contenido in secciones:
         for chunk in splitter.split_text(contenido):
-            if len(chunk.strip()) >= MIN_CHUNK_LEN:
-                meta: dict = {"fuente": archivo}
+            if len(chunk.strip()) >= MIN_CHUNK_LEN and _es_chunk_valido(chunk):
+                meta: dict = {"fuente": archivo, "tipo_doc": tipo_doc}
                 if heading:
                     meta["seccion"] = heading
+                    clausula = _extraer_clausula(heading)
+                    if clausula:
+                        meta["clausula"] = clausula
                 resultado.append((chunk, meta))
     return resultado
 
 
 def _extraer_chunks(ruta: str, archivo: str) -> list[tuple[str, dict]]:
+    tipo_doc = _tipo_documento(archivo)
     texto = md_converter.convert(ruta).text_content
-    return _chunksificar_por_secciones(texto, archivo)
+    # Unir palabras partidas por guión al final de línea (artefacto PDF)
+    texto = re.sub(r"(\w)-\n(\w)", r"\1\2", texto)
+    return _chunksificar_por_secciones(texto, archivo, tipo_doc)
 
 
 def obtener_coleccion(cliente: chromadb.PersistentClient) -> chromadb.Collection:
@@ -96,10 +162,22 @@ def obtener_coleccion(cliente: chromadb.PersistentClient) -> chromadb.Collection
     )
 
 
-def indexar_documentos(coleccion: chromadb.Collection) -> None:
-    archivos = [f for f in os.listdir(CARPETA_DOCS) if f.lower().endswith(EXTENSIONES)]
+def _listar_documentos() -> list[tuple[str, str]]:
+    """Devuelve lista de (ruta_absoluta, nombre_relativo) para todos los docs en CARPETA_DOCS."""
+    resultado = []
+    for raiz, _, ficheros in os.walk(CARPETA_DOCS):
+        for f in ficheros:
+            if f.lower().endswith(EXTENSIONES):
+                ruta_abs = os.path.join(raiz, f)
+                rel = os.path.relpath(ruta_abs, CARPETA_DOCS).replace("\\", "/")
+                resultado.append((ruta_abs, rel))
+    return resultado
 
-    if not archivos:
+
+def indexar_documentos(coleccion: chromadb.Collection) -> None:
+    documentos = _listar_documentos()
+
+    if not documentos:
         console.print("[red]No hay documentos en 'documentos/'[/red]")
         return
 
@@ -107,8 +185,7 @@ def indexar_documentos(coleccion: chromadb.Collection) -> None:
     hashes_nuevos = {}
     cambios = False
 
-    for archivo in archivos:
-        ruta = os.path.join(CARPETA_DOCS, archivo)
+    for ruta, archivo in documentos:
         hash_actual = _hash_archivo(ruta)
         hashes_nuevos[archivo] = hash_actual
 
@@ -129,10 +206,11 @@ def indexar_documentos(coleccion: chromadb.Collection) -> None:
 
             if chunks_con_meta:
                 docs, metas = zip(*chunks_con_meta)
+                id_base = re.sub(r"[^a-zA-Z0-9_\-]", "_", archivo)
                 coleccion.add(
                     documents=list(docs),
                     metadatas=list(metas),
-                    ids=[f"{archivo}_{i}" for i in range(len(docs))],
+                    ids=[f"{id_base}_{i}" for i in range(len(docs))],
                 )
             cambios = True
             console.print(f"      [green]→ {len(chunks_con_meta)} fragmentos[/green]")

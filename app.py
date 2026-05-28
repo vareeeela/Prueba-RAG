@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import uuid
 from datetime import datetime
 
@@ -8,7 +7,7 @@ import chromadb
 import streamlit as st
 
 from src.config import RUTA_BD
-from src.generator import es_inyeccion_prompt, generar_respuesta
+from src.generator import es_inyeccion_prompt, generar_respuesta, resumen_fuentes, respuesta_identidad
 from src.indexer import indexar_documentos, obtener_coleccion
 from src.retriever import buscar_contexto
 
@@ -72,16 +71,6 @@ def borrar_conversacion(conv_id: str) -> None:
     if os.path.exists(ruta):
         os.remove(ruta)
     guardar_indice([c for c in cargar_indice() if c["id"] != conv_id])
-
-
-_PATRON_SALUDO = re.compile(
-    r"^(hola|buenos\s+(días|tardes|noches)|buenas|hey|hi|hello|qué\s+tal|cómo\s+est[aá]s?)[!?,. ]*$",
-    re.IGNORECASE,
-)
-
-
-def es_saludo(texto: str) -> bool:
-    return bool(_PATRON_SALUDO.match(texto.strip()))
 
 
 def migrar_historial_legacy() -> None:
@@ -194,19 +183,6 @@ with st.sidebar:
     st.divider()
 
 
-_PATRON_FUENTE = re.compile(r'\n*FUENTE:\s*(.+)$', re.MULTILINE)
-
-
-def _extraer_fuente(texto: str) -> tuple[str, str]:
-    """Separa la línea FUENTE del cuerpo. Devuelve (cuerpo, fuente)."""
-    m = _PATRON_FUENTE.search(texto)
-    if not m:
-        return texto.strip(), ""
-    fuente = m.group(1).strip()
-    cuerpo = texto[:m.start()].strip()
-    return cuerpo, fuente
-
-
 # ── Mostrar historial ──────────────────────────────────────────────────────
 
 for msg in st.session_state.mensajes:
@@ -231,13 +207,14 @@ if pregunta := st.chat_input("Escribe tu pregunta..."):
 
     fuente_citada = ""
     with st.chat_message("assistant"):
-        if es_saludo(pregunta):
-            respuesta = "¡Hola! Soy lucIA, un asistente basado en tu documentación. ¿En qué puedo ayudarte?"
-            st.write(respuesta)
+        resp_fija = respuesta_identidad(pregunta)
+        if resp_fija:
+            respuesta = resp_fija
+            st.markdown(respuesta)
         elif es_inyeccion_prompt(pregunta):
             respuesta = (
                 "Esta solicitud parece intentar modificar mi comportamiento o rol. "
-                "Sólo puedo responder preguntas sobre los documentos disponibles."
+                "Solo puedo responder preguntas sobre los documentos disponibles."
             )
             st.write(respuesta)
         else:
@@ -245,16 +222,15 @@ if pregunta := st.chat_input("Escribe tu pregunta..."):
                 chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo)
 
             if not chunks:
-                respuesta = "Esta consulta no parece estar relacionada con el contenido de los documentos disponibles en esta herramienta."
+                respuesta = "Esta consulta no está cubierta por los documentos disponibles."
                 st.write(respuesta)
             else:
                 placeholder = st.empty()
-                texto_completo = ""
+                respuesta = ""
                 for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo):
-                    texto_completo += token
-                    cuerpo, _ = _extraer_fuente(texto_completo)
-                    placeholder.markdown(cuerpo)
-                respuesta, fuente_citada = _extraer_fuente(texto_completo)
+                    respuesta += token
+                    placeholder.markdown(respuesta)
+                fuente_citada = resumen_fuentes(metas)
                 if fuente_citada:
                     st.caption(fuente_citada)
 

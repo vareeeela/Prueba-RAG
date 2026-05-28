@@ -10,7 +10,6 @@ MAX_HISTORIAL_REESCRITURA = 4  # mensajes recientes que se dan como contexto al 
 
 
 def _reescribir_con_contexto(pregunta: str, historial: list[dict]) -> str:
-    """Reescribe la pregunta añadiendo el contexto del historial para que sea autónoma."""
     if not historial:
         return pregunta
 
