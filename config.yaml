@@ -7,12 +7,12 @@ embeddings:
   modelo: "intfloat/multilingual-e5-large"
 
 retrieval:
-  n_resultados: 4
+  n_resultados: 6
   chunk_size: 1200
   chunk_overlap: 200
   min_chunk_len: 80
-  similarity_threshold: 0.45
-  n_query_variants: 2
+  similarity_threshold: 0.55
+  n_query_variants: 3
   extensiones:
     - ".pdf"
     - ".docx"

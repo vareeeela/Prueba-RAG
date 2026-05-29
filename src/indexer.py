@@ -167,6 +167,8 @@ def _listar_documentos() -> list[tuple[str, str]]:
     resultado = []
     for raiz, _, ficheros in os.walk(CARPETA_DOCS):
         for f in ficheros:
+            if f.startswith("~$"):
+                continue
             if f.lower().endswith(EXTENSIONES):
                 ruta_abs = os.path.join(raiz, f)
                 rel = os.path.relpath(ruta_abs, CARPETA_DOCS).replace("\\", "/")
@@ -187,9 +189,9 @@ def indexar_documentos(coleccion: chromadb.Collection) -> None:
 
     for ruta, archivo in documentos:
         hash_actual = _hash_archivo(ruta)
-        hashes_nuevos[archivo] = hash_actual
 
         if hashes_previos.get(archivo) == hash_actual:
+            hashes_nuevos[archivo] = hash_actual
             console.print(f"   [dim]Sin cambios: {archivo}[/dim]")
             continue
 
@@ -212,6 +214,7 @@ def indexar_documentos(coleccion: chromadb.Collection) -> None:
                     metadatas=list(metas),
                     ids=[f"{id_base}_{i}" for i in range(len(docs))],
                 )
+            hashes_nuevos[archivo] = hash_actual
             cambios = True
             console.print(f"      [green]→ {len(chunks_con_meta)} fragmentos[/green]")
 
