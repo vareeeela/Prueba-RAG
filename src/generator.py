@@ -49,7 +49,7 @@ def resumen_fuentes(metas: list[dict]) -> str:
         tipo = _ETIQUETAS_TIPO.get(meta.get("tipo_doc", ""), "")
         clave = f"{fuente} [{tipo}]" if tipo else fuente
         por_doc.setdefault(clave, [])
-        ref = meta.get("clausula") or meta.get("seccion", "")[:40]
+        ref = meta.get("clausula") or meta.get("seccion", "")
         if ref and ref not in por_doc[clave]:
             por_doc[clave].append(ref)
 
@@ -65,12 +65,18 @@ def resumen_fuentes(metas: list[dict]) -> str:
 _STOPS = ["Pregunta:", "Usuario:", "\n¿", "\nAssistant:"]
 
 _PATRON_IDENTIDAD = re.compile(
-    r"^\s*(qu[eé]\s+eres|qui[eé]n\s+eres|qu[eé]\s+(puedes|haces|sabes|ofreces)|"
-    r"c[oó]mo\s+te\s+llamas|cu[aá]l\s+es\s+tu\s+(nombre|funci[oó]n|prop[oó]sito)|"
+    r"^\s*[¿]?\s*(qu[eé]\s+eres|qui[eé]n\s+eres|qu[eé]\s+(?:puedes|haces|sabes|ofreces)|"
+    r"c[oó]mo\s+te\s+llamas|cu[aá]l\s+es\s+tu\s+(?:nombre|funci[oó]n|prop[oó]sito)|"
     r"para\s+qu[eé]\s+sirves?|qu[eé]\s+tipo\s+de\s+asistente|"
-    r"d[ií]me\s+qu[eé]\s+eres|"
-    r"hola|buenos\s+(d[ií]as|tardes|noches)|buenas|hey|hi|hello|"
-    r"qu[eé]\s+tal|c[oó]mo\s+est[aá]s?)[.!?,\s]*$",
+    r"d[ií]me\s+qu[eé]\s+eres|pres[eé]ntate)[.!?,¿\s]*$",
+    re.IGNORECASE,
+)
+
+# Saludos: solo se exige que el mensaje EMPIECE con el saludo y sea corto (≤40 chars).
+# Así "Buenas tardes" y "Hola, ¿qué tal?" no caen al RAG.
+_PATRON_SALUDO = re.compile(
+    r"^\s*(?:hola|buenas(?:\s+(?:d[ií]as|tardes|noches))?|buenos\s+(?:d[ií]as|tardes|noches)|"
+    r"hey|hi\b|hello|qu[eé]\s+tal|c[oó]mo\s+est[aá]s?)\b",
     re.IGNORECASE,
 )
 
@@ -85,9 +91,20 @@ _RESPUESTA_IDENTIDAD = (
     "¿En qué puedo ayudarte?"
 )
 
+_RESPUESTA_SALUDO = (
+    "Hola. Soy **lucIA**, asistente de seguridad de la información.\n\n"
+    "Puedes preguntarme sobre la documentación interna, la normativa ISO 27001/27002 "
+    "o pedirme un análisis de cumplimiento de un control concreto."
+)
+
 
 def respuesta_identidad(texto: str) -> str | None:
-    return _RESPUESTA_IDENTIDAD if _PATRON_IDENTIDAD.match(texto.strip()) else None
+    t = texto.strip()
+    if _PATRON_IDENTIDAD.match(t):
+        return _RESPUESTA_IDENTIDAD
+    if len(t) <= 40 and _PATRON_SALUDO.match(t):
+        return _RESPUESTA_SALUDO
+    return None
 
 
 # ── Prompts de sistema por modo ──────────────────────────────────────────────
@@ -173,6 +190,27 @@ _SISTEMAS = {
     "general": _SISTEMA_GENERAL,
 }
 
+_SISTEMA_EVIDENCIAS = (
+    "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
+    "Se te proporciona el texto de un reporte de evidencias operativas "
+    "(escaneo de vulnerabilidades, resultados de herramientas como Tenable, Scorecard, Nessus u otras).\n\n"
+    "TU TAREA:\n"
+    "Enumera de forma concisa todos los hallazgos, vulnerabilidades o resultados relevantes del reporte.\n\n"
+    "FORMATO PARA CADA HALLAZGO:\n"
+    "N. **[ID/CVE si existe] Nombre o título** — Severidad: CRÍTICA/ALTA/MEDIA/BAJA/INFORMATIVA\n"
+    "   Descripción: una o dos líneas indicando el problema y el recurso/sistema afectado.\n\n"
+    "CIERRE CON UN RESUMEN:\n"
+    "**Resumen:** X hallazgos totales — Crítica: N | Alta: N | Media: N | Baja: N | Informativa: N\n\n"
+    "REGLAS:\n"
+    "- Extrae los datos del reporte tal como aparecen; no inventes datos.\n"
+    "- Si el reporte está en inglés, traduce los títulos al español.\n"
+    "- Si la severidad no está indicada, escribe 'Sin clasificar'.\n"
+    "- Sin frases de relleno ni introducción. Empieza directamente con el hallazgo 1.\n"
+    "- Si se plantea una pregunta adicional, respóndela después del resumen."
+)
+
+_MAX_TOKENS_EVIDENCIAS = 2048
+
 _MODO_LABEL = {
     "norma": "consulta normativa ISO",
     "interna": "consulta documentación interna",
@@ -183,6 +221,13 @@ _MODO_LABEL = {
 
 # ── Construcción del contexto ────────────────────────────────────────────────
 
+def _resumir_seccion(seccion: str, max_len: int = 80) -> str:
+    if len(seccion) <= max_len:
+        return seccion
+    corte = seccion[:max_len].rsplit(' ', 1)[0]
+    return f"{corte}…"
+
+
 def _construir_contexto(chunks: list[str], metas: list[dict], intencion: str) -> str:
     if intencion != "comparacion":
         partes = []
@@ -190,7 +235,7 @@ def _construir_contexto(chunks: list[str], metas: list[dict], intencion: str) ->
             tipo = _ETIQUETAS_TIPO.get(meta.get("tipo_doc", ""), "Documento")
             clausula = meta.get("clausula", "")
             seccion = meta.get("seccion", "")
-            ref = f"Cláusula {clausula}" if clausula else (seccion[:50] if seccion else "")
+            ref = f"Cláusula {clausula}" if clausula else (_resumir_seccion(seccion) if seccion else "")
             cabecera = f"[{i}] {tipo.upper()}" + (f" — {ref}" if ref else "")
             partes.append(f"{cabecera}\n{chunk}")
         return "\n\n".join(partes)
@@ -206,7 +251,7 @@ def _construir_contexto(chunks: list[str], metas: list[dict], intencion: str) ->
         for i, (chunk, meta) in enumerate(norma, 1):
             clausula = meta.get("clausula", "")
             seccion = meta.get("seccion", "")
-            ref = f"Cláusula {clausula}" if clausula else (seccion[:50] if seccion else "")
+            ref = f"Cláusula {clausula}" if clausula else (_resumir_seccion(seccion) if seccion else "")
             cabecera = f"[N{i}] NORMA ISO" + (f" — {ref}" if ref else "")
             partes.append(f"{cabecera}\n{chunk}")
 
@@ -216,7 +261,7 @@ def _construir_contexto(chunks: list[str], metas: list[dict], intencion: str) ->
             tipo = _ETIQUETAS_TIPO.get(meta.get("tipo_doc", ""), "Doc. interno")
             clausula = meta.get("clausula", "")
             seccion = meta.get("seccion", "")
-            ref = f"Cláusula {clausula}" if clausula else (seccion[:50] if seccion else "")
+            ref = f"Cláusula {clausula}" if clausula else (_resumir_seccion(seccion) if seccion else "")
             cabecera = f"[I{i}] {tipo.upper()}" + (f" — {ref}" if ref else "")
             partes.append(f"{cabecera}\n{chunk}")
 
@@ -295,6 +340,52 @@ def generar_respuesta(
             frequency_penalty=1.0,
             presence_penalty=0.3,
             stop=_STOPS,
+        )
+        for chunk in stream:
+            yield chunk.choices[0].delta.content or ""
+
+
+def analizar_evidencias(texto_reporte: str, consulta: str = "") -> Iterator[str]:
+    MAX_CHARS = 40_000
+    if len(texto_reporte) > MAX_CHARS:
+        texto_reporte = (
+            texto_reporte[:MAX_CHARS]
+            + "\n\n[REPORTE TRUNCADO — se muestran los primeros 40 000 caracteres]"
+        )
+
+    contenido = f"REPORTE DE EVIDENCIAS:\n\n{texto_reporte}"
+    if consulta.strip():
+        contenido += f"\n\n---\nPregunta adicional: {consulta}"
+
+    mensajes = [
+        {"role": "system", "content": _SISTEMA_EVIDENCIAS},
+        {"role": "user", "content": contenido},
+    ]
+
+    if MODO == "local":
+        import ollama
+        stream = ollama.chat(
+            model=MODELO_LLM,
+            messages=mensajes,
+            stream=True,
+            options={
+                "temperature": TEMPERATURE,
+                "num_predict": _MAX_TOKENS_EVIDENCIAS,
+                "repeat_penalty": 1.3,
+            },
+        )
+        for parte in stream:
+            yield parte["message"]["content"]
+    else:
+        from groq import Groq
+        stream = Groq(api_key=GROQ_API_KEY).chat.completions.create(
+            model=MODELO_GROQ,
+            messages=mensajes,
+            stream=True,
+            temperature=TEMPERATURE,
+            max_tokens=_MAX_TOKENS_EVIDENCIAS,
+            frequency_penalty=1.0,
+            presence_penalty=0.3,
         )
         for chunk in stream:
             yield chunk.choices[0].delta.content or ""

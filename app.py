@@ -1,17 +1,42 @@
 import json
 import os
+import tempfile
 import uuid
 from datetime import datetime
 
 import chromadb
 import streamlit as st
 
-from src.config import RUTA_BD
-from src.generator import es_inyeccion_prompt, generar_respuesta, resumen_fuentes, respuesta_identidad
+from src.config import RUTA_BD, md_converter
+from src.generator import (
+    analizar_evidencias,
+    es_inyeccion_prompt,
+    generar_respuesta,
+    resumen_fuentes,
+    respuesta_identidad,
+)
 from src.indexer import indexar_documentos, obtener_coleccion
 from src.retriever import buscar_contexto
 
 RUTA_CONVERSACIONES = os.path.join(RUTA_BD, "conversations")
+_TIPOS_REPORTE = ["pdf", "txt", "csv", "md"]
+
+
+def extraer_texto_reporte(uploaded_file) -> str:
+    nombre = uploaded_file.name.lower()
+    if any(nombre.endswith(f".{ext}") for ext in ("txt", "csv", "md")):
+        return uploaded_file.read().decode("utf-8", errors="replace")
+    suffix = os.path.splitext(nombre)[1] or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
+    try:
+        resultado = md_converter.convert(tmp_path)
+        return resultado.text_content
+    except Exception as exc:
+        return f"[Error extrayendo texto del archivo: {exc}]"
+    finally:
+        os.remove(tmp_path)
 RUTA_INDICE = os.path.join(RUTA_BD, "conversations_index.json")
 RUTA_HISTORIAL_LEGACY = os.path.join(RUTA_BD, "historial.json")
 
@@ -183,60 +208,98 @@ with st.sidebar:
     st.divider()
 
 
-# ── Mostrar historial ──────────────────────────────────────────────────────
+# ── Tabs ───────────────────────────────────────────────────────────────────
 
-for msg in st.session_state.mensajes:
-    with st.chat_message(msg["rol"]):
-        st.write(msg["contenido"])
-        if msg.get("fuente_citada"):
-            st.caption(msg["fuente_citada"])
+tab_chat, tab_evidencias = st.tabs(["💬 Chat ISO 27001/27002", "📋 Análisis de evidencias"])
 
+with tab_chat:
+    for msg in st.session_state.mensajes:
+        with st.chat_message(msg["rol"]):
+            st.write(msg["contenido"])
+            if msg.get("fuente_citada"):
+                st.caption(msg["fuente_citada"])
 
-# ── Input ──────────────────────────────────────────────────────────────────
+    if pregunta := st.chat_input("Escribe tu pregunta..."):
+        with st.chat_message("user"):
+            st.write(pregunta)
 
-if pregunta := st.chat_input("Escribe tu pregunta..."):
-    with st.chat_message("user"):
-        st.write(pregunta)
+        historial_previo = st.session_state.mensajes.copy()
 
-    historial_previo = st.session_state.mensajes.copy()
+        if not historial_previo:
+            actualizar_titulo(st.session_state.conv_id, pregunta)
 
-    if not historial_previo:
-        actualizar_titulo(st.session_state.conv_id, pregunta)
+        st.session_state.mensajes.append({"rol": "user", "contenido": pregunta})
 
-    st.session_state.mensajes.append({"rol": "user", "contenido": pregunta})
-
-    fuente_citada = ""
-    with st.chat_message("assistant"):
-        resp_fija = respuesta_identidad(pregunta)
-        if resp_fija:
-            respuesta = resp_fija
-            st.markdown(respuesta)
-        elif es_inyeccion_prompt(pregunta):
-            respuesta = (
-                "Esta solicitud parece intentar modificar mi comportamiento o rol. "
-                "Solo puedo responder preguntas sobre los documentos disponibles."
-            )
-            st.write(respuesta)
-        else:
-            with st.spinner("Buscando en documentación..."):
-                chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo)
-
-            if not chunks:
-                respuesta = "Esta consulta no está cubierta por los documentos disponibles."
+        fuente_citada = ""
+        with st.chat_message("assistant"):
+            resp_fija = respuesta_identidad(pregunta)
+            if resp_fija:
+                respuesta = resp_fija
+                st.markdown(respuesta)
+            elif es_inyeccion_prompt(pregunta):
+                respuesta = (
+                    "Esta solicitud parece intentar modificar mi comportamiento o rol. "
+                    "Solo puedo responder preguntas sobre los documentos disponibles."
+                )
                 st.write(respuesta)
             else:
-                placeholder = st.empty()
-                respuesta = ""
-                for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo):
-                    respuesta += token
-                    placeholder.markdown(respuesta)
-                fuente_citada = resumen_fuentes(metas)
-                if fuente_citada:
-                    st.caption(fuente_citada)
+                with st.spinner("Buscando en documentación..."):
+                    chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo)
 
-    st.session_state.mensajes.append({
-        "rol": "assistant",
-        "contenido": respuesta,
-        "fuente_citada": fuente_citada,
-    })
-    guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)
+                if not chunks:
+                    respuesta = "Esta consulta no está cubierta por los documentos disponibles."
+                    st.write(respuesta)
+                else:
+                    placeholder = st.empty()
+                    respuesta = ""
+                    for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo):
+                        respuesta += token
+                        placeholder.markdown(respuesta)
+                    fuente_citada = resumen_fuentes(metas)
+                    if fuente_citada:
+                        st.caption(fuente_citada)
+
+        st.session_state.mensajes.append({
+            "rol": "assistant",
+            "contenido": respuesta,
+            "fuente_citada": fuente_citada,
+        })
+        guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)
+
+
+with tab_evidencias:
+    st.caption(
+        "Sube un reporte de evidencias operativas (Tenable, Scorecard, Nessus…) "
+        "para obtener un listado enumerado y conciso de los hallazgos."
+    )
+
+    archivo = st.file_uploader("Cargar reporte", type=_TIPOS_REPORTE)
+    consulta_adicional = st.text_input(
+        "Pregunta adicional (opcional)",
+        placeholder="p. ej. ¿cuántas vulnerabilidades críticas hay?",
+    )
+
+    col_analizar, col_limpiar = st.columns([3, 1])
+    with col_analizar:
+        analizar = st.button("Analizar reporte", type="primary", disabled=archivo is None)
+    with col_limpiar:
+        if st.button("Limpiar resultado"):
+            st.session_state.pop("evidencias_resultado", None)
+            st.rerun()
+
+    if analizar and archivo:
+        with st.spinner("Extrayendo texto del reporte..."):
+            texto_reporte = extraer_texto_reporte(archivo)
+
+        if texto_reporte.startswith("[Error"):
+            st.error(texto_reporte)
+        else:
+            ev_placeholder = st.empty()
+            ev_resultado = ""
+            for token in analizar_evidencias(texto_reporte, consulta_adicional):
+                ev_resultado += token
+                ev_placeholder.markdown(ev_resultado)
+            st.session_state.evidencias_resultado = ev_resultado
+
+    elif st.session_state.get("evidencias_resultado"):
+        st.markdown(st.session_state.evidencias_resultado)

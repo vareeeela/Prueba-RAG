@@ -9,22 +9,34 @@ from .config import (
 )
 
 MAX_HISTORIAL_REESCRITURA = 4
+N_MINIMO_POR_LADO_COMPARACION = 3
 
 _TIPOS_INTERNOS = ["politica", "procedimiento", "documento_interno"]
 
 # Palabras clave para detectar intención de la pregunta
 _RE_NORMA = re.compile(
-    r'\biso\b|iso[\s\-]?27\d{3}|27001|27002'
-    r'|\bnorma\b|\bnormativa\b|\bestándar\b'
+    r'\biso\b'
+    r'|iso[\s\-]?27\d{3}'
+    r'|\b27001\b|\b27002\b'
+    r'|\bnorma\b'
+    r'|\bnormativa\b(?!\s+interna)'
+    r'|\bestándar(?:es)?\b(?!\s*[\?\.,;:]|\s+(de\s+)?(usuario|usuarios|cuenta|cuentas))'
+    r'|\bestandar(?:es)?\b(?!\s*[\?\.,;:]|\s+(de\s+)?(usuario|usuarios|cuenta|cuentas))'
     r'|\bcontrol\s+\d|\bcontrol\s+[A-Z]\.\d'
-    r'|\bcláusula\s+\d|\brequisito\s+de\s+la\s+norma\b',
+    r'|\bcláusula\s+\d|\bclausula\s+\d'
+    r'|\brequisito\s+de\s+la\s+norma\b',
     re.IGNORECASE,
 )
 _RE_INTERNA = re.compile(
-    r'\bmi\s+empresa\b|\bmi\s+organizaci[oó]n\b'
+    r'\bmi\s+empresa\b'
+    r'|\bmi\s+organizaci[oó]n\b'
+    r'|\bmi\s+(política|politica|normativa|procedimiento)\b'
     r'|\bnuestra[s]?\b|\bnuestro[s]?\b'
-    r'|\bdocumentaci[oó]n\s+interna\b|\bpol[ií]tica\s+(de|interna)\b'
-    r'|\bprocedimiento\s+(de|interno)\b|\bmarmotech\b',
+    r'|\bdocumentaci[oó]n\s+interna\b'
+    r'|\bpolítica\s+(de|interna)\b|\bpolitica\s+(de|interna)\b'
+    r'|\bnormativa\s+(de|interna)\b'
+    r'|\bprocedimiento\s+(de|interno)\b'
+    r'|\bmarmotech\b',
     re.IGNORECASE,
 )
 _RE_COMPARAR = re.compile(
@@ -97,13 +109,41 @@ def _reescribir_con_contexto(pregunta: str, historial: list[dict]) -> str:
         return pregunta
 
 
-def _generar_variantes(pregunta: str) -> list[str]:
-    prompt = (
-        f"Genera {N_QUERY_VARIANTS} reformulaciones diferentes de la siguiente pregunta "
-        f"para mejorar la búsqueda en documentos. "
-        f"Responde SOLO con las preguntas reformuladas, una por línea, sin numeración ni explicaciones.\n\n"
-        f"Pregunta original: {pregunta}"
-    )
+def _generar_variantes(pregunta: str, orientacion: str = "neutra") -> list[str]:
+    """
+    Genera N_QUERY_VARIANTS reformulaciones de la pregunta para mejorar el retrieval.
+
+    orientacion controla el sesgo léxico de las variantes:
+      - "neutra":   reformulaciones generales (modos norma, interna y general).
+      - "norma":    variantes orientadas a la normativa ISO (control, cláusula, requisito).
+      - "interna":  variantes orientadas a documentación interna (datos operativos concretos).
+    """
+    if orientacion == "norma":
+        prompt = (
+            f"Genera {N_QUERY_VARIANTS} reformulaciones de la siguiente pregunta orientadas "
+            f"a recuperar información de NORMAS ISO/IEC (controles, cláusulas, requisitos). "
+            f"Usa vocabulario normativo: 'control', 'cláusula', 'requisito', 'exige', 'recomienda'. "
+            f"Responde SOLO con las preguntas reformuladas, una por línea, sin numeración ni explicaciones.\n\n"
+            f"Pregunta original: {pregunta}"
+        )
+    elif orientacion == "interna":
+        prompt = (
+            f"Genera {N_QUERY_VARIANTS} reformulaciones de la siguiente pregunta orientadas "
+            f"a recuperar el dato operativo concreto en POLÍTICAS o PROCEDIMIENTOS INTERNOS de una empresa. "
+            f"Usa términos concretos del dominio: parámetros numéricos, plazos, longitudes, nombres de sistemas, "
+            f"responsables, frecuencias, valores específicos. "
+            f"Evita vocabulario abstracto como 'recomendación', 'estándar', 'norma' o 'control'. "
+            f"Responde SOLO con las preguntas reformuladas, una por línea, sin numeración ni explicaciones.\n\n"
+            f"Pregunta original: {pregunta}"
+        )
+    else:
+        prompt = (
+            f"Genera {N_QUERY_VARIANTS} reformulaciones diferentes de la siguiente pregunta "
+            f"para mejorar la búsqueda en documentos. "
+            f"Responde SOLO con las preguntas reformuladas, una por línea, sin numeración ni explicaciones.\n\n"
+            f"Pregunta original: {pregunta}"
+        )
+
     try:
         if MODO == "local":
             import ollama
@@ -127,6 +167,7 @@ def _ejecutar_variantes(
     coleccion: chromadb.Collection,
     variantes: list[str],
     where: dict | None = None,
+    ignorar_umbral: bool = False,
 ) -> tuple[list[str], list[dict]]:
     """Lanza las variantes contra la colección con el filtro indicado."""
     vistos: set[str] = set()
@@ -144,13 +185,27 @@ def _ejecutar_variantes(
             kwargs["where"] = where
         res = coleccion.query(**kwargs)
         for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-            if dist > SIMILARITY_THRESHOLD or doc in vistos:
+            if (not ignorar_umbral and dist > SIMILARITY_THRESHOLD) or doc in vistos:
                 continue
             vistos.add(doc)
             docs_final.append(doc)
-            metas_final.append(meta)
+            meta_entry = dict(meta)
+            meta_entry["distancia"] = dist
+            metas_final.append(meta_entry)
 
     return docs_final, metas_final
+
+
+def _log_chunks(docs: list[str], metas: list[dict]) -> None:
+    console.print(f"[dim][retrieval] {len(docs)} chunks recuperados:[/dim]")
+    for i, meta in enumerate(metas, 1):
+        dist = meta.get("distancia")
+        dist_str = f"{dist:.3f}" if isinstance(dist, float) else "?"
+        console.print(
+            f"[dim]  [{i}] {meta.get('fuente', '?')} "
+            f"cláusula={meta.get('clausula', '-')} "
+            f"dist={dist_str}[/dim]"
+        )
 
 
 def buscar_contexto(
@@ -164,25 +219,72 @@ def buscar_contexto(
         console.print(f"[dim]Pregunta reformulada: {pregunta_busqueda}[/dim]")
 
     console.print("[dim]Generando variantes de búsqueda...[/dim]")
-    variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda)
 
     if intencion == "norma":
-        return _ejecutar_variantes(coleccion, variantes, {"tipo_doc": "norma_iso"})
+        variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="norma")
+        docs, metas = _ejecutar_variantes(coleccion, variantes, {"tipo_doc": "norma_iso"})
+        _log_chunks(docs, metas)
+        return docs, metas
 
     if intencion == "interna":
-        return _ejecutar_variantes(
+        variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="interna")
+        docs, metas = _ejecutar_variantes(
             coleccion, variantes, {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
         )
+        _log_chunks(docs, metas)
+        return docs, metas
 
     if intencion == "comparacion":
-        # Búsqueda separada para garantizar resultados de ambas fuentes
+        # Dos conjuntos independientes de variantes, sesgados a cada lado
+        variantes_norma = [pregunta_busqueda] + _generar_variantes(
+            pregunta_busqueda, orientacion="norma"
+        )
+        variantes_interna = [pregunta_busqueda] + _generar_variantes(
+            pregunta_busqueda, orientacion="interna"
+        )
+
         chunks_n, metas_n = _ejecutar_variantes(
-            coleccion, variantes, {"tipo_doc": "norma_iso"}
+            coleccion, variantes_norma, {"tipo_doc": "norma_iso"}
         )
         chunks_i, metas_i = _ejecutar_variantes(
-            coleccion, variantes, {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
+            coleccion, variantes_interna, {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
         )
-        return chunks_n + chunks_i, metas_n + metas_i
 
-    # general: sin filtro
-    return _ejecutar_variantes(coleccion, variantes, None)
+        # Garantizar mínimo por cada lado aunque queden bajo el umbral
+        if len(chunks_n) < N_MINIMO_POR_LADO_COMPARACION:
+            fb_n, fb_metas_n = _ejecutar_variantes(
+                coleccion, variantes_norma, {"tipo_doc": "norma_iso"}, ignorar_umbral=True
+            )
+            vistos_n = set(chunks_n)
+            faltan = N_MINIMO_POR_LADO_COMPARACION - len(chunks_n)
+            for c, m in zip(fb_n, fb_metas_n):
+                if c not in vistos_n and faltan > 0:
+                    chunks_n.append(c)
+                    metas_n.append(m)
+                    vistos_n.add(c)
+                    faltan -= 1
+
+        if len(chunks_i) < N_MINIMO_POR_LADO_COMPARACION:
+            fb_i, fb_metas_i = _ejecutar_variantes(
+                coleccion, variantes_interna,
+                {"tipo_doc": {"$in": _TIPOS_INTERNOS}}, ignorar_umbral=True,
+            )
+            vistos_i = set(chunks_i)
+            faltan = N_MINIMO_POR_LADO_COMPARACION - len(chunks_i)
+            for c, m in zip(fb_i, fb_metas_i):
+                if c not in vistos_i and faltan > 0:
+                    chunks_i.append(c)
+                    metas_i.append(m)
+                    vistos_i.add(c)
+                    faltan -= 1
+
+        docs = chunks_n + chunks_i
+        metas = metas_n + metas_i
+        _log_chunks(docs, metas)
+        return docs, metas
+
+    # general: sin filtro, variantes neutras
+    variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="neutra")
+    docs, metas = _ejecutar_variantes(coleccion, variantes, None)
+    _log_chunks(docs, metas)
+    return docs, metas
