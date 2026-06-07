@@ -23,7 +23,7 @@ _PATRON_INYECCION = re.compile(
     r"|olvida\s+que\s+eres\s+lucIA"
     r"|forget\s+(that\s+)?you\s+are\s+lucIA"
     r"|\[SYSTEM\]|\[INST\]|<\|system\|>"
-    r"|(muéstrame?|repite|dame?|revela|imprime|muestra)\s+(todo\s+)?(el\s+)?(contexto|prompt|instrucciones?)"
+    r"|(muéstrame?|repite|dame?|dime|revela|imprime|muestra)\s+(tod[ao]s?\s+)?(tus?\s+|las?\s+)?(el\s+)?(contexto|prompt|instrucciones?)"
     r"|(show|print|repeat|reveal|output|display)\s+(your\s+)?(context|system\s+prompt|instructions?|full\s+context)"
     r"|responde\s+con\s+todo",
     re.IGNORECASE,
@@ -65,7 +65,7 @@ def resumen_fuentes(metas: list[dict]) -> str:
 _STOPS = ["Pregunta:", "Usuario:", "\n¿", "\nAssistant:"]
 
 _PATRON_IDENTIDAD = re.compile(
-    r"^\s*[¿]?\s*(qu[eé]\s+eres|qui[eé]n\s+eres|qu[eé]\s+(?:puedes|haces|sabes|ofreces)|"
+    r"^\s*[¿]?\s*(qu[eé]\s+eres|qui[eé]n\s+eres|qu[eé]\s+(?:puedes|haces|sabes|ofreces)(?:\s+hacer)?|"
     r"c[oó]mo\s+te\s+llamas|cu[aá]l\s+es\s+tu\s+(?:nombre|funci[oó]n|prop[oó]sito)|"
     r"para\s+qu[eé]\s+sirves?|qu[eé]\s+tipo\s+de\s+asistente|"
     r"d[ií]me\s+qu[eé]\s+eres|pres[eé]ntate)[.!?,¿\s]*$",
@@ -210,6 +210,7 @@ _SISTEMA_EVIDENCIAS = (
 )
 
 _MAX_TOKENS_EVIDENCIAS = 2048
+_MAX_TOKENS_POR_MODO = {"comparacion": 1500}
 
 _MODO_LABEL = {
     "norma": "consulta normativa ISO",
@@ -313,6 +314,7 @@ def generar_respuesta(
     intencion: str = "general",
 ) -> Iterator[str]:
     mensajes = _construir_mensajes(chunks, metas, pregunta, historial or [], intencion)
+    max_tok = _MAX_TOKENS_POR_MODO.get(intencion, MAX_TOKENS)
 
     if MODO == "local":
         import ollama
@@ -322,7 +324,7 @@ def generar_respuesta(
             stream=True,
             options={
                 "temperature": TEMPERATURE,
-                "num_predict": MAX_TOKENS,
+                "num_predict": max_tok,
                 "repeat_penalty": 1.3,
                 "stop": _STOPS,
             },
@@ -336,7 +338,7 @@ def generar_respuesta(
             messages=mensajes,
             stream=True,
             temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tok,
             frequency_penalty=1.0,
             presence_penalty=0.3,
             stop=_STOPS,

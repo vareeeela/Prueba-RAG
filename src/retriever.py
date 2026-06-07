@@ -33,9 +33,9 @@ _RE_INTERNA = re.compile(
     r'|\bmi\s+(política|politica|normativa|procedimiento)\b'
     r'|\bnuestra[s]?\b|\bnuestro[s]?\b'
     r'|\bdocumentaci[oó]n\s+interna\b'
-    r'|\bpolítica\s+(de|interna)\b|\bpolitica\s+(de|interna)\b'
-    r'|\bnormativa\s+(de|interna)\b'
-    r'|\bprocedimiento\s+(de|interno)\b'
+    r'|\bpolítica\s+interna\b|\bpolitica\s+interna\b'
+    r'|\bnormativa\s+interna\b'
+    r'|\bprocedimiento\s+interno\b'
     r'|\bmarmotech\b',
     re.IGNORECASE,
 )
