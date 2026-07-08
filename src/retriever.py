@@ -43,7 +43,8 @@ _RE_COMPARAR = re.compile(
     r'\bcumpl[ei]\b|\bcumplimiento\b|\bgap\b|\bbrecha[s]?\b'
     r'|\bcompar[ae]\b|\bconforme\b|\bverifica\b|\banaliz[ae]\b'
     r'|\bcumple\s+con\b|\bsatisface\b|\bse\s+ajusta\b|\badecuado\b'
-    r'|\bcumple[n]?\s+(mis|nuestros?|la|los|con)',
+    r'|\bcumple[n]?\s+(mis|nuestros?|la|los|con)'
+    r'|\bcubr[aeo]\b|\bcubierto\b',
     re.IGNORECASE,
 )
 
@@ -283,8 +284,12 @@ def buscar_contexto(
         _log_chunks(docs, metas)
         return docs, metas
 
-    # general: sin filtro, variantes neutras
-    variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="neutra")
+    # general: sin filtro, variantes neutras + interna para ampliar cobertura semántica
+    variantes = (
+        [pregunta_busqueda]
+        + _generar_variantes(pregunta_busqueda, orientacion="neutra")
+        + _generar_variantes(pregunta_busqueda, orientacion="interna")
+    )
     docs, metas = _ejecutar_variantes(coleccion, variantes, None)
     _log_chunks(docs, metas)
     return docs, metas

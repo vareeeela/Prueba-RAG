@@ -42,12 +42,15 @@ _ETIQUETAS_TIPO = {
 }
 
 
-def resumen_fuentes(metas: list[dict]) -> str:
+def resumen_fuentes(metas: list[dict], neutro: bool = False) -> str:
     por_doc: dict[str, list] = {}
     for meta in metas:
         fuente = meta["fuente"]
         tipo = _ETIQUETAS_TIPO.get(meta.get("tipo_doc", ""), "")
-        clave = f"{fuente} [{tipo}]" if tipo else fuente
+        if neutro:
+            clave = f"{fuente} ({tipo.lower()})" if tipo else fuente
+        else:
+            clave = f"{fuente} [{tipo}]" if tipo else fuente
         por_doc.setdefault(clave, [])
         ref = meta.get("clausula") or meta.get("seccion", "")
         if ref and ref not in por_doc[clave]:
@@ -55,11 +58,11 @@ def resumen_fuentes(metas: list[dict]) -> str:
 
     partes = []
     for clave, refs in por_doc.items():
-        if refs:
-            partes.append(f"{clave} ({', '.join(refs)})")
-        else:
-            partes.append(clave)
-    return " | ".join(partes)
+        partes.append(f"{clave} ({', '.join(refs)})" if refs else clave)
+
+    sep = "; " if neutro else " | "
+    cuerpo = sep.join(partes)
+    return f"Fuentes consultadas: {cuerpo}" if neutro else cuerpo
 
 
 _STOPS = ["Pregunta:", "Usuario:", "\n¿", "\nAssistant:"]
@@ -115,7 +118,7 @@ _SISTEMA_NORMA = (
     "Responde ÚNICAMENTE con la información que aparezca en esos documentos. "
     "No hagas referencia a documentación interna de ninguna empresa ni a ejemplos de implementación.\n\n"
     "FORMATO:\n"
-    "• Empieza con '§ X.Y — Título del control/cláusula' si hay referencia numérica.\n"
+    "• Empieza con 'X.Y — Título del control/cláusula' si hay referencia numérica.\n"
     "• Una frase de síntesis del propósito del control.\n"
     "• Lista de 3-5 puntos clave concretos que exige o recomienda la norma.\n"
     "• Sin marcadores [N], sin preguntas retóricas, sin frases de relleno.\n\n"
@@ -161,24 +164,20 @@ _SISTEMA_COMPARACION = (
 )
 
 _SISTEMA_GENERAL = (
-    "RESTRICCIÓN ABSOLUTA: Eres un sistema RAG. Tu ÚNICA fuente de información son los "
-    "documentos numerados [1], [2]... incluidos en cada mensaje. "
-    "Si un dato no aparece en esos documentos, no lo menciones. "
-    "Usar conocimiento externo es un error grave.\n\n"
     "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
-    "FORMATO DE RESPUESTA:\n"
-    "• Consulta informativa o normativa: empieza con '§ X.Y — Título' solo si esa numeración "
-    "aparece literalmente en los documentos (nunca inventes números de cláusula); "
-    "una frase de síntesis y una lista de 3-4 puntos clave concretos. "
-    "NO incluyas la línea 'CUMPLIMIENTO: ...' en respuestas puramente informativas.\n"
-    "• Análisis de cumplimiento (solo cuando la pregunta contenga palabras como 'cumple', "
-    "'cumplimiento', 'se ajusta', 'cubre la norma' o similares): contexto breve, "
-    "aspectos cubiertos/no cubiertos, y cierra con "
-    "'CUMPLIMIENTO: COMPLETO / PARCIAL / NO CUMPLE / SIN INFORMACIÓN'.\n"
-    "  - Usa SIN INFORMACIÓN si el tema no aparece en los documentos; "
-    "nunca uses NO CUMPLE por mera ausencia de datos.\n"
-    "• Interpreta y sintetiza en español; no traduzcas párrafos literales.\n"
-    "• Sin marcadores [N], sin preguntas, sin frases de relleno.\n\n"
+    "REGLAS:\n"
+    "1. Usa exclusivamente los documentos numerados [1], [2]... del mensaje. "
+    "No uses conocimiento externo.\n"
+    "2. Si los documentos definen un esquema con criterios (niveles de clasificación, "
+    "categorías de riesgo, tipos de incidente…), aplica esos criterios para dar una respuesta "
+    "directa y concreta. No listes posibilidades — da la respuesta correcta y justifícala "
+    "citando el criterio del documento que la soporta.\n"
+    "3. Nunca añadas 'CUMPLIMIENTO: …' salvo que la pregunta use explícitamente palabras "
+    "como 'cumple', 'cumplimiento', 'conforme' o 'se ajusta'.\n\n"
+    "FORMATO:\n"
+    "• Respuesta directa en 1-2 frases con el dato concreto.\n"
+    "• Lista de 2-4 puntos de apoyo citando los documentos con datos exactos.\n"
+    "• Sin marcadores [N], sin preguntas retóricas, sin frases de relleno.\n\n"
     "Si la información no está en los documentos: "
     "'Esta consulta no está cubierta por los documentos disponibles.'"
 )
@@ -188,6 +187,76 @@ _SISTEMAS = {
     "interna": _SISTEMA_INTERNA,
     "comparacion": _SISTEMA_COMPARACION,
     "general": _SISTEMA_GENERAL,
+}
+
+# ── Prompts neutralizados para evaluación ciega ──────────────────────────────
+# Conservan todas las restricciones de tarea (idioma, fuente única, criterios
+# de veredicto). Solo eliminan el bloque de FORMATO que produce la firma visual.
+
+_SISTEMA_NORMA_BRUTO = (
+    "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
+    "RESTRICCIÓN: Los documentos incluidos son exclusivamente normativa ISO/IEC. "
+    "Responde ÚNICAMENTE con información de esos documentos. "
+    "No hagas referencia a documentación interna de ninguna organización.\n\n"
+    "FORMATO: Responde en prosa continua, sin encabezados, sin '§ X.Y — Título' "
+    "y sin listas con viñetas. Si citas una cláusula o control, hazlo en el texto "
+    "y solo si su numeración aparece literalmente en los documentos; nunca la inventes. "
+    "Sin marcadores [N], sin frases de relleno.\n\n"
+    "Si la información no está en los documentos: "
+    "'Esta consulta no está cubierta por los documentos disponibles.'"
+)
+
+_SISTEMA_INTERNA_BRUTO = (
+    "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
+    "RESTRICCIÓN: Los documentos incluidos son exclusivamente documentación interna. "
+    "Responde ÚNICAMENTE con información que aparezca en ellos. "
+    "No menciones normativas ISO, estándares externos ni buenas prácticas del sector.\n\n"
+    "FORMATO: Responde en prosa continua, sin encabezados y sin listas con viñetas. "
+    "Si hay nombres propios, códigos o etiquetas específicas, cítalos literalmente. "
+    "Sin marcadores [N], sin frases de relleno.\n\n"
+    "Si la información no está en los documentos: "
+    "'Esta información no figura en la documentación interna disponible.'"
+)
+
+_SISTEMA_COMPARACION_BRUTO = (
+    "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
+    "Los documentos están divididos en dos secciones: la normativa ISO/IEC (lo que exige "
+    "o recomienda la norma) y la documentación interna (lo que tiene implementado la "
+    "organización).\n\n"
+    "Tu tarea es un análisis de cumplimiento. En prosa continua, sin encabezados, sin "
+    "viñetas y sin pasos numerados: resume qué exige la normativa, resume qué establece "
+    "la documentación interna citando datos concretos (nombres propios, cifras, "
+    "procedimientos), compara ambos y concluye con un veredicto expresado en lenguaje "
+    "natural (se cumple, se cumple parcialmente, no se cumple, o no hay información "
+    "suficiente) seguido de una justificación breve.\n\n"
+    "CRITERIOS: cumplimiento completo si la documentación interna implementa la sustancia "
+    "del control aunque use otros nombres; parcial si faltan elementos requeridos; "
+    "incumplimiento si el requisito está ausente. No confundas ausencia de información "
+    "con incumplimiento: si el tema no aparece, indícalo como falta de información.\n\n"
+    "No uses la etiqueta 'CUMPLIMIENTO: ...'. Sin marcadores [N], sin frases de relleno."
+)
+
+_SISTEMA_GENERAL_BRUTO = (
+    "RESTRICCIÓN ABSOLUTA: Eres un sistema RAG. Tu ÚNICA fuente de información son los "
+    "documentos numerados incluidos en cada mensaje. Si un dato no aparece en ellos, no lo "
+    "menciones. Usar conocimiento externo es un error grave.\n\n"
+    "Eres lucIA, asistente de seguridad de la información. Respondes SIEMPRE en español.\n\n"
+    "FORMATO: Responde en prosa continua, sin encabezados, sin '§ X.Y — Título' y sin "
+    "listas con viñetas. Incluye un veredicto en lenguaje natural (se cumple / parcialmente / "
+    "no se cumple / sin información) ÚNICAMENTE si la pregunta plantea de forma explícita una "
+    "cuestión de cumplimiento (con palabras como 'cumple', 'cumplimiento', 'se ajusta', "
+    "'cubre la norma'). Si es una consulta informativa, NO incluyas ningún veredicto ni frase "
+    "de cierre evaluativa. Usa 'sin información' si el tema no aparece; nunca concluyas "
+    "incumplimiento por mera ausencia de datos. Sin marcadores [N], sin relleno.\n\n"
+    "Si la información no está en los documentos: "
+    "'Esta consulta no está cubierta por los documentos disponibles.'"
+)
+
+_SISTEMAS_BRUTO = {
+    "norma": _SISTEMA_NORMA_BRUTO,
+    "interna": _SISTEMA_INTERNA_BRUTO,
+    "comparacion": _SISTEMA_COMPARACION_BRUTO,
+    "general": _SISTEMA_GENERAL_BRUTO,
 }
 
 _SISTEMA_EVIDENCIAS = (
@@ -275,8 +344,10 @@ def _construir_mensajes(
     pregunta: str,
     historial: list[dict],
     intencion: str,
+    modo_salida: str = "estructurado",
 ) -> list[dict]:
-    sistema = _SISTEMAS.get(intencion, _SISTEMA_GENERAL)
+    tabla = _SISTEMAS_BRUTO if modo_salida == "bruto" else _SISTEMAS
+    sistema = tabla.get(intencion, tabla["general"])
     mensajes = [{"role": "system", "content": sistema}]
 
     for msg in historial[-MAX_TURNOS_HISTORIAL:]:
@@ -312,8 +383,9 @@ def generar_respuesta(
     pregunta: str,
     historial: list[dict] | None = None,
     intencion: str = "general",
+    modo_salida: str = "estructurado",
 ) -> Iterator[str]:
-    mensajes = _construir_mensajes(chunks, metas, pregunta, historial or [], intencion)
+    mensajes = _construir_mensajes(chunks, metas, pregunta, historial or [], intencion, modo_salida)
     max_tok = _MAX_TOKENS_POR_MODO.get(intencion, MAX_TOKENS)
 
     if MODO == "local":

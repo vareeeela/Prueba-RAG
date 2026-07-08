@@ -16,7 +16,7 @@ from src.generator import (
     respuesta_identidad,
 )
 from src.indexer import indexar_documentos, obtener_coleccion
-from src.retriever import buscar_contexto
+from src.retriever import buscar_contexto, detectar_intencion
 
 RUTA_CONVERSACIONES = os.path.join(RUTA_BD, "conversations")
 _TIPOS_REPORTE = ["pdf", "txt", "csv", "md"]
@@ -243,8 +243,9 @@ with tab_chat:
                 )
                 st.write(respuesta)
             else:
+                intencion = detectar_intencion(pregunta)
                 with st.spinner("Buscando en documentación..."):
-                    chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo)
+                    chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo, intencion=intencion)
 
                 if not chunks:
                     respuesta = "Esta consulta no está cubierta por los documentos disponibles."
@@ -252,7 +253,7 @@ with tab_chat:
                 else:
                     placeholder = st.empty()
                     respuesta = ""
-                    for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo):
+                    for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo, intencion=intencion):
                         respuesta += token
                         placeholder.markdown(respuesta)
                     fuente_citada = resumen_fuentes(metas)
@@ -265,6 +266,7 @@ with tab_chat:
             "fuente_citada": fuente_citada,
         })
         guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)
+        st.rerun()
 
 
 with tab_evidencias:
