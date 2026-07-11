@@ -374,6 +374,127 @@ def _log_chunks(docs: list[str], metas: list[dict]) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Recuperación híbrida: BM25 + fusión RRF
+# ---------------------------------------------------------------------------
+
+def _matches_where(meta: dict, where: dict | None) -> bool:
+    """Evalúa un filtro ChromaDB simplificado contra un metadato."""
+    if where is None:
+        return True
+    for key, val in where.items():
+        if isinstance(val, dict):
+            if "$in" in val and meta.get(key) not in val["$in"]:
+                return False
+            if "$eq" in val and meta.get(key) != val["$eq"]:
+                return False
+        elif meta.get(key) != val:
+            return False
+    return True
+
+
+_bm25_index: "object | None" = None
+
+
+class _BM25Index:
+    def __init__(self, coleccion: chromadb.Collection) -> None:
+        from rank_bm25 import BM25Okapi
+        result = coleccion.get(include=["documents", "metadatas"])
+        self._docs: list[str] = result["documents"] or []
+        self._metas: list[dict] = result["metadatas"] or []
+        corpus = [re.findall(r"\w+", d.lower()) for d in self._docs]
+        self._bm25 = BM25Okapi(corpus) if corpus else None
+
+    def search(
+        self, query: str, n: int, where: dict | None = None
+    ) -> list[tuple[str, dict]]:
+        if self._bm25 is None or not self._docs:
+            return []
+        tokens = re.findall(r"\w+", query.lower())
+        scores = self._bm25.get_scores(tokens)
+        pairs = [
+            (i, float(scores[i]))
+            for i in range(len(self._docs))
+            if scores[i] > 0.0 and _matches_where(self._metas[i], where)
+        ]
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        return [(self._docs[i], self._metas[i]) for i, _ in pairs[:n]]
+
+
+def _get_bm25(coleccion: chromadb.Collection) -> _BM25Index:
+    global _bm25_index
+    if _bm25_index is None:
+        _bm25_index = _BM25Index(coleccion)
+        console.print(f"[dim][BM25] Índice construido ({len(_bm25_index._docs)} docs)[/dim]")
+    return _bm25_index
+
+
+def reset_bm25() -> None:
+    """Invalida el índice BM25 en memoria (llamar tras reindexar documentos)."""
+    global _bm25_index
+    _bm25_index = None
+
+
+_RRF_K = 60
+
+
+def _rrf_fusion(
+    dense: list[tuple[str, dict]],
+    sparse: list[tuple[str, dict]],
+    vistos: set[str],
+) -> tuple[list[str], list[dict]]:
+    """Reciprocal Rank Fusion (k=60): combina ranking denso y disperso en uno solo."""
+    rrf: dict[str, float] = {}
+    doc_meta: dict[str, dict] = {}
+
+    for rank, (doc, meta) in enumerate(dense):
+        if doc in vistos:
+            continue
+        rrf[doc] = rrf.get(doc, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        doc_meta[doc] = meta
+
+    for rank, (doc, meta) in enumerate(sparse):
+        if doc in vistos:
+            continue
+        rrf[doc] = rrf.get(doc, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        doc_meta.setdefault(doc, meta)
+
+    ordered = sorted(rrf, key=lambda d: rrf[d], reverse=True)
+    vistos.update(ordered)
+    return [d for d in ordered], [doc_meta[d] for d in ordered]
+
+
+def _ejecutar_hibrido(
+    coleccion: chromadb.Collection,
+    pregunta: str,
+    variantes: list[str],
+    where: dict | None,
+    vistos: set[str],
+    hyde_text: str | None,
+) -> tuple[list[str], list[dict]]:
+    """Retrieval híbrido: dense (HyDE + variantes) + BM25, fusionados con RRF."""
+    local_vistos: set[str] = set()
+    hyde_docs, hyde_metas = (
+        _ejecutar_hyde(coleccion, hyde_text, where, local_vistos) if hyde_text else ([], [])
+    )
+    dense_docs, dense_metas = _ejecutar_variantes(coleccion, variantes, where, vistos=local_vistos)
+    dense_sorted = sorted(
+        zip(hyde_docs + dense_docs, hyde_metas + dense_metas),
+        key=lambda x: x[1].get("distancia", 1.0),
+    )
+
+    bm25 = _get_bm25(coleccion)
+    sparse: list[tuple[str, dict]] = []
+    seen_bm25: set[str] = set()
+    for q in [pregunta] + variantes:
+        for doc, meta in bm25.search(q, N_RESULTADOS, where):
+            if doc not in seen_bm25:
+                sparse.append((doc, meta))
+                seen_bm25.add(doc)
+
+    return _rrf_fusion(list(dense_sorted), sparse, vistos)
+
+
 def buscar_contexto(
     coleccion: chromadb.Collection,
     pregunta: str,
@@ -386,9 +507,6 @@ def buscar_contexto(
 
     console.print("[dim]Generando variantes de búsqueda...[/dim]")
 
-    # Fragmento hipotético (HyDE): se embebe con prefijo passage: para buscar
-    # en el espacio semántico de los documentos, no en el de las preguntas.
-    # Los resultados se anteponen a los de las variantes de query normales.
     hyde_text = _generar_hyde(pregunta_busqueda)
     if hyde_text:
         console.print("[dim][HyDE] Fragmento hipotético generado[/dim]")
@@ -396,12 +514,9 @@ def buscar_contexto(
     if intencion == "norma":
         filtro = {"tipo_doc": "norma_iso"}
         vistos: set[str] = set()
-        hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, filtro, vistos) if hyde_text else ([], [])
         variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="norma")
-        docs, metas = _ejecutar_variantes(coleccion, variantes, filtro, vistos=vistos)
-        docs, metas = hyde_docs + docs, hyde_metas + metas
+        docs, metas = _ejecutar_hibrido(coleccion, pregunta_busqueda, variantes, filtro, vistos, hyde_text)
 
-        # Fallback: si la pregunta menciona un número de cláusula, forzar su recuperación
         clausulas_mencionadas = _RE_CLAUSULA_NORMA.findall(pregunta_busqueda)
         if clausulas_mencionadas:
             extra_docs, extra_metas = _forzar_clausulas_norma(
@@ -411,21 +526,16 @@ def buscar_contexto(
                 docs = extra_docs + docs
                 metas = extra_metas + metas
 
-        docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
+        docs, metas = docs[:MAX_CONTEXT_CHUNKS], metas[:MAX_CONTEXT_CHUNKS]
         _log_chunks(docs, metas)
         return docs, metas
 
     if intencion == "interna":
         filtro = {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
         vistos: set[str] = set()
-        hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, filtro, vistos) if hyde_text else ([], [])
         variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="interna")
-        docs, metas = _ejecutar_variantes(coleccion, variantes, filtro, vistos=vistos)
-        docs, metas = hyde_docs + docs, hyde_metas + metas
+        docs, metas = _ejecutar_hibrido(coleccion, pregunta_busqueda, variantes, filtro, vistos, hyde_text)
 
-        # Fallback de esquemas: si la pregunta es sobre clasificación y ya recuperamos
-        # alguna sección 5.x pero faltan subsecciones, forzar su recuperación por metadata.
-        # Resuelve la brecha semántica entre terminología del usuario y vocabulario del documento.
         if _RE_CLASIFICACION.search(pregunta_busqueda):
             clausulas_ya = {str(m.get("clausula", "")) for m in metas}
             fuentes_5x = [
@@ -442,7 +552,7 @@ def buscar_contexto(
                     docs = extra_docs + docs
                     metas = extra_metas + metas
 
-        docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
+        docs, metas = docs[:MAX_CONTEXT_CHUNKS], metas[:MAX_CONTEXT_CHUNKS]
         _log_chunks(docs, metas)
         return docs, metas
 
@@ -454,24 +564,22 @@ def buscar_contexto(
             pregunta_busqueda, orientacion="interna"
         )
 
-        # Lado norma: HyDE + variantes
+        # Lado norma: híbrido (dense + BM25 + RRF)
         filtro_n = {"tipo_doc": "norma_iso"}
         vistos_n: set[str] = set()
-        hyde_n, hyde_metas_n = _ejecutar_hyde(coleccion, hyde_text, filtro_n, vistos_n) if hyde_text else ([], [])
-        chunks_n, metas_n = _ejecutar_variantes(coleccion, variantes_norma, filtro_n, vistos=vistos_n)
-        chunks_n, metas_n = hyde_n + chunks_n, hyde_metas_n + metas_n
+        chunks_n, metas_n = _ejecutar_hibrido(
+            coleccion, pregunta_busqueda, variantes_norma, filtro_n, vistos_n, hyde_text
+        )
 
-        # Lado interna: HyDE + variantes (vistos independiente para no contaminar cruce)
+        # Lado interna: híbrido (vistos independiente para no contaminar cruce)
         filtro_i = {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
         vistos_i: set[str] = set()
-        hyde_i, hyde_metas_i = _ejecutar_hyde(coleccion, hyde_text, filtro_i, vistos_i) if hyde_text else ([], [])
-        chunks_i, metas_i = _ejecutar_variantes(coleccion, variantes_interna, filtro_i, vistos=vistos_i)
-        chunks_i, metas_i = hyde_i + chunks_i, hyde_metas_i + metas_i
+        chunks_i, metas_i = _ejecutar_hibrido(
+            coleccion, pregunta_busqueda, variantes_interna, filtro_i, vistos_i, hyde_text
+        )
 
-        # Búsqueda contextual cruzada: usa el texto de los chunks norma recuperados
-        # como embedding passage para buscar el equivalente en docs internos.
-        # Cierra la brecha semántica cuando la query original es anafórica o corta
-        # y la sección interna relevante usa vocabulario distinto al de la query.
+        # Búsqueda contextual cruzada: usa texto de chunks norma para buscar equivalente interno.
+        # Cierra la brecha cuando el vocabulario de la query no coincide con el del doc interno.
         if chunks_n:
             norma_ctx = " ".join(chunks_n[:2])[:800]
             ctx_docs, ctx_metas = _ejecutar_hyde(coleccion, norma_ctx, filtro_i, vistos_i)
@@ -510,23 +618,23 @@ def buscar_contexto(
                     vistos_extra.add(c)
                     faltan -= 1
 
-        chunks_n, metas_n = _recortar_contexto(chunks_n, metas_n, MAX_CONTEXT_CHUNKS_POR_LADO)
-        chunks_i, metas_i = _recortar_contexto(chunks_i, metas_i, MAX_CONTEXT_CHUNKS_POR_LADO)
+        chunks_n = chunks_n[:MAX_CONTEXT_CHUNKS_POR_LADO]
+        metas_n = metas_n[:MAX_CONTEXT_CHUNKS_POR_LADO]
+        chunks_i = chunks_i[:MAX_CONTEXT_CHUNKS_POR_LADO]
+        metas_i = metas_i[:MAX_CONTEXT_CHUNKS_POR_LADO]
         docs = chunks_n + chunks_i
         metas = metas_n + metas_i
         _log_chunks(docs, metas)
         return docs, metas
 
-    # general: HyDE + variantes neutras + interna, sin filtro de tipo
+    # general: híbrido sin filtro de tipo
     vistos: set[str] = set()
-    hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, None, vistos) if hyde_text else ([], [])
     variantes = (
         [pregunta_busqueda]
         + _generar_variantes(pregunta_busqueda, orientacion="neutra")
         + _generar_variantes(pregunta_busqueda, orientacion="interna")
     )
-    docs, metas = _ejecutar_variantes(coleccion, variantes, None, vistos=vistos)
-    docs, metas = hyde_docs + docs, hyde_metas + metas
-    docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
+    docs, metas = _ejecutar_hibrido(coleccion, pregunta_busqueda, variantes, None, vistos, hyde_text)
+    docs, metas = docs[:MAX_CONTEXT_CHUNKS], metas[:MAX_CONTEXT_CHUNKS]
     _log_chunks(docs, metas)
     return docs, metas
