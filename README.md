@@ -1,15 +1,17 @@
-# lucIA — Sistema RAG
+# lucIA — Asistente de Cumplimiento ISO 27001/27002
 
-Sistema de Retrieval-Augmented Generation (RAG). Permite hacer preguntas sobre documentos y obtener respuestas fundamentadas en búsqueda semántica, con interfaz web y memoria conversacional.
+Sistema de Retrieval-Augmented Generation (RAG) especializado en seguridad de la información. Permite consultar la normativa ISO/IEC 27001 e ISO/IEC 27002, analizar la documentación interna de una organización y evaluar su grado de cumplimiento.
 
 ## Características
 
 - **Búsqueda semántica** con embeddings multilingües (`intfloat/multilingual-e5-large`)
-- **Multi-query**: genera variantes de cada pregunta para mejorar el retrieval
-- **Referencias exactas**: cita la página (PDFs) o sección (otros formatos) del documento fuente
+- **Multi-query con HyDE**: genera variantes de cada pregunta y documentos hipotéticos para mejorar el retrieval
+- **Detección de intención**: enruta automáticamente entre consulta normativa, consulta interna y análisis de cumplimiento
+- **Reescritura anafórica**: resuelve referencias al contexto conversacional antes de buscar
+- **Análisis de cumplimiento**: compara documentación interna con requisitos ISO punto a punto y emite veredicto
 - **Memoria conversacional**: el LLM recuerda los turnos anteriores de la misma sesión
 - **Historial persistente**: las conversaciones se guardan entre sesiones
-- **Interfaz web** con Streamlit (`app.py`) y **CLI** (`rag_v2.py`)
+- **Interfaz web** con Streamlit (`app.py`) y **CLI** (`src/main.py`)
 - **Dos modos de inferencia**: LLM local via Ollama o API de Groq
 - **Soporte multi-formato**: PDF, DOCX, PPTX, XLSX, TXT, Markdown
 - **Configuración centralizada** en `config.yaml`, sin tocar código
@@ -75,8 +77,7 @@ Modelos disponibles en `config.yaml`:
 | Modelo | Contexto | Cuándo usarlo |
 |---|---|---|
 | `llama-3.3-70b-versatile` | 128k | Mejor calidad general (por defecto) |
-| `mixtral-8x7b-32768` | 32k | Buena velocidad con calidad alta |
-| `llama-3.1-8b-instant` | 128k | Respuestas muy rápidas |
+| `llama-3.1-8b-instant` | 128k | Respuestas más rápidas, menor calidad |
 
 ---
 
@@ -127,7 +128,7 @@ Se abre automáticamente en `http://localhost:8501`.
 ### CLI
 
 ```bash
-python rag_v2.py
+python -m src.main
 ```
 
 Escribe `salir` para terminar.
@@ -149,13 +150,12 @@ tfg-rag/
 ├── config.yaml                # Parámetros de configuración
 ├── .env                       # API keys (no se sube a Git)
 ├── .gitignore
-├── rag_v2.py                  # Punto de entrada CLI
 ├── app.py                     # Interfaz web Streamlit
 ├── src/
 │   ├── config.py              # Carga config.yaml, constantes y singletons
-│   ├── indexer.py             # Chunking por página/sección, hashing e indexación
-│   ├── retriever.py           # Multi-query y búsqueda semántica en ChromaDB
-│   ├── generator.py           # Prompt con historial conversacional y llamada al LLM
+│   ├── indexer.py             # Chunking con metadatos ISO, hashing e indexación
+│   ├── retriever.py           # Detección de intención, HyDE, multi-query y búsqueda semántica
+│   ├── generator.py           # Prompts por modo, historial conversacional y llamada al LLM
 │   └── main.py                # Bucle CLI
 ├── documentos/                # Documentos a indexar (no se suben a Git)
 └── bd_vectorial/              # Base de datos ChromaDB e historial (generados automáticamente)
