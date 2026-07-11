@@ -42,10 +42,29 @@ _ETIQUETAS_TIPO = {
 }
 
 
+def _codigo_doc(fuente: str) -> str:
+    """Extrae el código corto del nombre de fichero (p. ej. 'NOR-SEG-009' o 'ISO/IEC 27001')."""
+    m = re.search(r'ISOIEC\s*(\d{5})\d{4}', fuente)
+    if m:
+        return f"ISO/IEC {m.group(1)}"
+    m = re.match(r'([A-Z]{2,4}-[A-Z]{2,4}-\d{3})', fuente)
+    if m:
+        return m.group(1)
+    return re.sub(r'\.[^.]+$', '', fuente).replace('_', ' ')
+
+
+def _nombre_corto(fuente: str) -> str:
+    """Convierte el nombre de fichero en una etiqueta legible."""
+    m = re.search(r'ISOIEC\s*(\d{5})(\d{4})', fuente)
+    if m:
+        return f"ISO/IEC {m.group(1)}:{m.group(2)}"
+    return re.sub(r'\.[^.]+$', '', fuente).replace('_', ' ')
+
+
 def resumen_fuentes(metas: list[dict], neutro: bool = False) -> str:
     por_doc: dict[str, list] = {}
     for meta in metas:
-        fuente = meta["fuente"]
+        fuente = _nombre_corto(meta.get("fuente", ""))
         tipo = _ETIQUETAS_TIPO.get(meta.get("tipo_doc", ""), "")
         if neutro:
             clave = f"{fuente} ({tipo.lower()})" if tipo else fuente
@@ -53,8 +72,10 @@ def resumen_fuentes(metas: list[dict], neutro: bool = False) -> str:
             clave = f"{fuente} [{tipo}]" if tipo else fuente
         por_doc.setdefault(clave, [])
         ref = meta.get("clausula") or meta.get("seccion", "")
-        if ref and ref not in por_doc[clave]:
-            por_doc[clave].append(ref)
+        if ref:
+            ref_fmt = f"§{ref}"
+            if ref_fmt not in por_doc[clave]:
+                por_doc[clave].append(ref_fmt)
 
     partes = []
     for clave, refs in por_doc.items():
@@ -63,6 +84,52 @@ def resumen_fuentes(metas: list[dict], neutro: bool = False) -> str:
     sep = "; " if neutro else " | "
     cuerpo = sep.join(partes)
     return f"Fuentes consultadas: {cuerpo}" if neutro else cuerpo
+
+
+def reemplazar_citas(respuesta: str, metas: list[dict]) -> str:
+    """Sustituye [N] por [DOC-CODE §CLAUSE] para que las citas sean legibles."""
+    def _sub(m: re.Match) -> str:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(metas):
+            meta = metas[idx]
+            codigo = _codigo_doc(meta.get("fuente", ""))
+            clausula = meta.get("clausula", "")
+            return f"[{codigo} §{clausula}]" if clausula else f"[{codigo}]"
+        return m.group(0)
+
+    return re.sub(r'\[(\d+)\]', _sub, respuesta)
+
+
+def extraer_metas_citadas(respuesta: str, metas: list[dict], intencion: str) -> list[dict]:
+    """Devuelve solo los metadatos de los chunks realmente citados en la respuesta.
+
+    Estrategia en dos pasos:
+    1. Citas numéricas [N] / [N1] / [I1] que el modelo añade inline.
+    2. Si no hay citas numéricas, busca referencias a cláusulas nombradas
+       en el texto ('Cláusula 5.3', 'punto 4.3', etc.) y filtra por ellas.
+    """
+    if intencion == "comparacion":
+        n_total = sum(1 for m in metas if m.get("tipo_doc") == "norma_iso")
+        n_refs = {int(x) - 1 for x in re.findall(r'\[N(\d+)\]', respuesta)}
+        i_refs = {n_total + int(x) - 1 for x in re.findall(r'\[I(\d+)\]', respuesta)}
+        indices = n_refs | i_refs
+    else:
+        indices = {int(x) - 1 for x in re.findall(r'\[(\d+)\]', respuesta) if x.isdigit()}
+
+    if indices:
+        return [m for i, m in enumerate(metas) if i in indices]
+
+    # Fallback: referencias a cláusulas mencionadas en el texto
+    clausulas_citadas = set(re.findall(
+        r'\b(?:cl[aá]usula|punto|secci[oó]n|apartado)\s+(\d+(?:\.\d+)*)\b',
+        respuesta, re.IGNORECASE,
+    ))
+    if clausulas_citadas:
+        filtradas = [m for m in metas if m.get("clausula") in clausulas_citadas]
+        if filtradas:
+            return filtradas
+
+    return metas
 
 
 _STOPS = ["Pregunta:", "Usuario:", "\n¿", "\nAssistant:"]
@@ -121,7 +188,9 @@ _SISTEMA_NORMA = (
     "• Empieza con 'X.Y — Título del control/cláusula' si hay referencia numérica.\n"
     "• Una frase de síntesis del propósito del control.\n"
     "• Lista de 3-5 puntos clave concretos que exige o recomienda la norma.\n"
-    "• Sin marcadores [N], sin preguntas retóricas, sin frases de relleno.\n\n"
+    "• Al usar información de un documento, añade [N] al final de la frase "
+    "(p. ej. '…el alcance debe estar documentado [1].'). "
+    "Sin preguntas retóricas, sin frases de relleno.\n\n"
     "Si la información no está en los documentos: "
     "'Esta consulta no está cubierta por la normativa disponible.'"
 )
@@ -131,12 +200,20 @@ _SISTEMA_INTERNA = (
     "RESTRICCIÓN: Los documentos incluidos son exclusivamente documentación interna de la organización. "
     "Responde ÚNICAMENTE con la información que aparezca en esos documentos. "
     "No hagas referencia a normativas ISO, estándares externos ni buenas prácticas del sector.\n\n"
-    "FORMATO:\n"
-    "• Describe lo que establece la documentación interna sobre el tema consultado.\n"
-    "• Usa puntos concretos con los datos exactos que aparecen en los documentos.\n"
-    "• Si hay nombres propios, códigos o etiquetas específicas, cítalos literalmente.\n"
-    "• Sin marcadores [N], sin preguntas retóricas, sin frases de relleno.\n\n"
-    "Si la información no está en los documentos: "
+    "REGLAS:\n"
+    "1. Si los documentos definen un esquema con criterios, niveles o ejemplos "
+    "(clasificación de la información, categorías de riesgo, tipos de incidente…), "
+    "aplica esos criterios para dar una respuesta directa. Puedes razonar por "
+    "eliminación: si un nivel excluye explícitamente un tipo de dato, ese dato "
+    "pertenece a un nivel superior; si un nivel se describe como 'por defecto para "
+    "lo no clasificado', los activos clasificados no pertenecen a él. "
+    "Da la respuesta concreta y justifícala citando el criterio o ejemplo del "
+    "documento que la soporta.\n"
+    "2. Usa puntos concretos con los datos exactos que aparecen en los documentos.\n"
+    "3. Si hay nombres propios, códigos o etiquetas específicas, cítalos literalmente.\n"
+    "4. Al usar información de un documento, añade [N] al final de la frase. "
+    "Sin preguntas retóricas, sin frases de relleno.\n\n"
+    "Si la información no está en los documentos ni puede inferirse de sus criterios: "
     "'Esta información no figura en la documentación interna disponible.'"
 )
 
@@ -146,7 +223,10 @@ _SISTEMA_COMPARACION = (
     "  • NORMATIVA ISO: lo que exige o recomienda la norma ISO/IEC.\n"
     "  • DOCUMENTACIÓN INTERNA: lo que tiene implementado la organización.\n\n"
     "Tu tarea es un análisis de cumplimiento estructurado:\n"
-    "1. Resume qué exige/recomienda la normativa sobre el tema consultado.\n"
+    "1. Resume qué exige/recomienda la normativa sobre el tema consultado, "
+    "citando ÚNICAMENTE lo que aparezca textualmente en los fragmentos [N…]. "
+    "Si ningún fragmento [N] cubre el requisito concreto, indícalo explícitamente "
+    "en lugar de usar conocimiento externo.\n"
     "2. Resume qué establece la documentación interna sobre ese mismo tema.\n"
     "3. Compara punto a punto de forma concreta y específica.\n"
     "4. Concluye con 'CUMPLIMIENTO: COMPLETO / PARCIAL / NO CUMPLE / SIN INFORMACIÓN' "
@@ -160,7 +240,8 @@ _SISTEMA_COMPARACION = (
     "nunca uses NO CUMPLE por mera ausencia de datos.\n\n"
     "En el paso 2, cita datos concretos de la documentación interna (nombres propios, cifras, "
     "procedimientos específicos) que den respuesta al control. No uses frases genéricas.\n\n"
-    "Sin marcadores [N], sin preguntas retóricas, sin frases de relleno."
+    "Al citar información de un documento, añade [N1], [N2], [I1], [I2], etc. al final de la frase. "
+    "Sin preguntas retóricas, sin frases de relleno."
 )
 
 _SISTEMA_GENERAL = (
@@ -177,7 +258,8 @@ _SISTEMA_GENERAL = (
     "FORMATO:\n"
     "• Respuesta directa en 1-2 frases con el dato concreto.\n"
     "• Lista de 2-4 puntos de apoyo citando los documentos con datos exactos.\n"
-    "• Sin marcadores [N], sin preguntas retóricas, sin frases de relleno.\n\n"
+    "• Al usar información de un documento, añade [N] al final de la frase. "
+    "Sin preguntas retóricas, sin frases de relleno.\n\n"
     "Si la información no está en los documentos: "
     "'Esta consulta no está cubierta por los documentos disponibles.'"
 )
@@ -224,7 +306,9 @@ _SISTEMA_COMPARACION_BRUTO = (
     "o recomienda la norma) y la documentación interna (lo que tiene implementado la "
     "organización).\n\n"
     "Tu tarea es un análisis de cumplimiento. En prosa continua, sin encabezados, sin "
-    "viñetas y sin pasos numerados: resume qué exige la normativa, resume qué establece "
+    "viñetas y sin pasos numerados: resume qué exige la normativa citando ÚNICAMENTE lo "
+    "que aparezca en los fragmentos [N…] disponibles (si no aparece, indícalo en lugar "
+    "de usar conocimiento externo), resume qué establece "
     "la documentación interna citando datos concretos (nombres propios, cifras, "
     "procedimientos), compara ambos y concluye con un veredicto expresado en lenguaje "
     "natural (se cumple, se cumple parcialmente, no se cumple, o no hay información "
@@ -279,7 +363,7 @@ _SISTEMA_EVIDENCIAS = (
 )
 
 _MAX_TOKENS_EVIDENCIAS = 2048
-_MAX_TOKENS_POR_MODO = {"comparacion": 1500}
+_MAX_TOKENS_POR_MODO = {"comparacion": 2500}
 
 _MODO_LABEL = {
     "norma": "consulta normativa ISO",
@@ -490,9 +574,11 @@ def preguntar(coleccion: chromadb.Collection, pregunta: str) -> None:
         console.print("[dim]" + "-" * 60 + "[/dim]")
         return
 
-    console.print("\n[bold]Respuesta:[/bold] ", end="")
+    respuesta_completa = ""
     for texto in generar_respuesta(chunks, metas, pregunta, intencion=intencion):
-        print(texto, end="", flush=True)
-    print()
-    console.print(f"\n[dim]Fuentes: {resumen_fuentes(metas)}[/dim]")
+        respuesta_completa += texto
+    respuesta_display = reemplazar_citas(respuesta_completa, metas)
+    console.print(f"\n[bold]Respuesta:[/bold] {respuesta_display}")
+    metas_citadas = extraer_metas_citadas(respuesta_completa, metas, intencion)
+    console.print(f"\n[dim]Fuentes: {resumen_fuentes(metas_citadas)}[/dim]")
     console.print("[dim]" + "-" * 60 + "[/dim]")

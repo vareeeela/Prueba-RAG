@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 
 import chromadb
 
@@ -10,6 +11,10 @@ from .config import (
 
 MAX_HISTORIAL_REESCRITURA = 4
 N_MINIMO_POR_LADO_COMPARACION = 3
+MAX_CONTEXT_CHUNKS = 20          # tope global de chunks enviados al modelo
+MAX_CONTEXT_CHUNKS_POR_LADO = 10 # para modo comparacion (cada lado norma/interna)
+# Umbral blando para el fallback interna: evita ruido extremo al forzar el mínimo
+_UMBRAL_FALLBACK = SIMILARITY_THRESHOLD + 0.20
 
 _TIPOS_INTERNOS = ["politica", "procedimiento", "documento_interno"]
 
@@ -36,7 +41,30 @@ _RE_INTERNA = re.compile(
     r'|\bpolítica\s+interna\b|\bpolitica\s+interna\b'
     r'|\bnormativa\s+interna\b'
     r'|\bprocedimiento\s+interno\b'
-    r'|\bmarmotech\b',
+    r'|\bmarmotech\b'
+    # Preguntas de aplicación práctica de políticas internas
+    r'|\b(con\s+qu[eé]|qu[eé])\s+etiqueta[s]?\b'
+    r'|\bqu[eé]\s+(nivel|categor[íi]a|tipo)\s+(de\s+)?(clasificaci[oó]n|confidencialidad)\b'
+    r'|\bc[oó]mo\s+(se\s+)?(clasifico|etiqueto|clasifica|etiqueta|clasificar[íi]a?|etiquetar[íi]a?)\b'
+    r'|\bdebo\s+(etiquetar|clasificar|tratar|gestionar)\b'
+    r'|\btengo\s+que\s+(etiquetar|clasificar)\b'
+    r'|\bqu[eé]\s+clasificaci[oó]n\s+(le\s+)?(corresponde|aplica|debo|tengo)\b'
+    r'|\bcontrase[ñn]a[s]?\b|\blongitud\s+(m[íi]nima|m[aá]xima)\b'
+    r'|\bplazo[s]?\s+de\b|\bcad[eu]ca\b|\bvigencia\b'
+    r'|\bresponsable[s]?\s+de\b|\bquién\s+(es\s+)?(responsible|encargado)\b',
+    re.IGNORECASE,
+)
+_RE_CLAUSULA_NORMA = re.compile(
+    r'(?:punto|p[uú]nto|cl[aá]usula|secci[oó]n|apartado|art[íi]culo|control)\s+(\d+(?:\.\d+)*)',
+    re.IGNORECASE,
+)
+_RE_CLASIFICACION = re.compile(
+    r"etiqueta[s]?\b"
+    r"|qu[eé]\s+(?:nivel|clasificaci[oó]n)\b"
+    r"|c[oó]mo\s+(?:se\s+)?(?:clasifico|etiqueto|clasificar|etiquetar)\b"
+    r"|debo\s+(?:etiquetar|clasificar)\b"
+    r"|nivel\s+de\s+clasificaci[oó]n\b"
+    r"|qu[eé]\s+clasificaci[oó]n\b",
     re.IGNORECASE,
 )
 _RE_COMPARAR = re.compile(
@@ -102,7 +130,7 @@ def _reescribir_con_contexto(pregunta: str, historial: list[dict]) -> str:
             resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
                 model=MODELO_GROQ,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
+                max_tokens=400,
             )
             reescrita = resp.choices[0].message.content.strip()
         return reescrita or pregunta
@@ -156,6 +184,7 @@ def _generar_variantes(pregunta: str, orientacion: str = "neutra") -> list[str]:
             resp = cliente.chat.completions.create(
                 model=MODELO_GROQ,
                 messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
             )
             texto = resp.choices[0].message.content
 
@@ -164,14 +193,82 @@ def _generar_variantes(pregunta: str, orientacion: str = "neutra") -> list[str]:
         return []
 
 
+def _generar_hyde(pregunta: str) -> str | None:
+    """Genera un fragmento de documento hipotético (HyDE) para mejorar el retrieval.
+
+    El texto generado se embebe con prefijo 'passage:' para que su vector sea
+    comparable directamente con los documentos indexados, cerrando la brecha
+    semántica entre la pregunta (espacio de queries) y la respuesta (espacio de pasajes).
+    """
+    prompt = (
+        "Escribe un fragmento breve (3-5 líneas) de un documento de política de seguridad "
+        "de la información que contendría la respuesta a la siguiente pregunta. "
+        "Usa terminología técnica concreta. Solo el texto del fragmento, sin encabezado.\n\n"
+        f"Pregunta: {pregunta}"
+    )
+    try:
+        if MODO == "local":
+            import ollama
+            resp = ollama.chat(
+                model=MODELO_LLM,
+                messages=[{"role": "user", "content": prompt}],
+                options={"num_predict": 120},
+            )
+            return resp["message"]["content"].strip()
+        else:
+            from groq import Groq
+            resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
+                model=MODELO_GROQ,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+def _ejecutar_hyde(
+    coleccion: chromadb.Collection,
+    hyde_text: str,
+    where: dict | None = None,
+    vistos: set[str] | None = None,
+) -> tuple[list[str], list[dict]]:
+    """Busca con el embedding passage: del texto hipotético y actualiza vistos."""
+    if vistos is None:
+        vistos = set()
+    hyde_emb = embedding_fn([hyde_text])[0]  # prefijo passage:, como los docs indexados
+    kwargs: dict = dict(
+        query_embeddings=[hyde_emb],
+        n_results=N_RESULTADOS,
+        include=["documents", "metadatas", "distances"],
+    )
+    if where:
+        kwargs["where"] = where
+    res = coleccion.query(**kwargs)
+    docs_final: list[str] = []
+    metas_final: list[dict] = []
+    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+        if dist > SIMILARITY_THRESHOLD or doc in vistos:
+            continue
+        vistos.add(doc)
+        docs_final.append(doc)
+        meta_entry = dict(meta)
+        meta_entry["distancia"] = dist
+        metas_final.append(meta_entry)
+    return docs_final, metas_final
+
+
 def _ejecutar_variantes(
     coleccion: chromadb.Collection,
     variantes: list[str],
     where: dict | None = None,
     ignorar_umbral: bool = False,
+    vistos: set[str] | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Lanza las variantes contra la colección con el filtro indicado."""
-    vistos: set[str] = set()
+    if vistos is None:
+        vistos = set()
     docs_final: list[str] = []
     metas_final: list[dict] = []
 
@@ -195,6 +292,74 @@ def _ejecutar_variantes(
             metas_final.append(meta_entry)
 
     return docs_final, metas_final
+
+
+def _forzar_clausulas_norma(
+    coleccion: chromadb.Collection,
+    clausulas: list[str],
+    vistos: set[str],
+) -> tuple[list[str], list[dict]]:
+    """Recupera cláusulas ISO por metadata cuando se mencionan explícitamente en la pregunta."""
+    try:
+        res = coleccion.get(
+            where={"$and": [
+                {"tipo_doc": {"$eq": "norma_iso"}},
+                {"clausula": {"$in": clausulas}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs, metas = [], []
+        for doc, meta in zip(res.get("documents", []), res.get("metadatas", [])):
+            if doc in vistos:
+                continue
+            vistos.add(doc)
+            docs.append(doc)
+            metas.append({**meta, "distancia": 0.0})
+        return docs, metas
+    except Exception:
+        return [], []
+
+
+def _forzar_secciones_documento(
+    coleccion: chromadb.Collection,
+    fuente: str,
+    clausulas: list[str],
+    vistos: set[str],
+) -> tuple[list[str], list[dict]]:
+    """Recupera secciones específicas de un documento por metadata exacta.
+
+    Se usa como fallback cuando la búsqueda semántica no recupera secciones
+    que sabemos que existen por su clausula pero cuyo vocabulario no coincide
+    con la consulta del usuario (brecha semántica de terminología específica).
+    """
+    try:
+        res = coleccion.get(
+            where={"$and": [
+                {"fuente": {"$eq": fuente}},
+                {"clausula": {"$in": clausulas}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs, metas = [], []
+        for doc, meta in zip(res.get("documents", []), res.get("metadatas", [])):
+            if doc in vistos:
+                continue
+            vistos.add(doc)
+            docs.append(doc)
+            metas.append({**meta, "distancia": 0.0})
+        return docs, metas
+    except Exception:
+        return [], []
+
+
+def _recortar_contexto(
+    docs: list[str], metas: list[dict], max_chunks: int
+) -> tuple[list[str], list[dict]]:
+    """Ordena por distancia y recorta al máximo de chunks permitido."""
+    if len(docs) <= max_chunks:
+        return docs, metas
+    paired = sorted(zip(docs, metas), key=lambda x: x[1].get("distancia", 1.0))
+    return [d for d, _ in paired[:max_chunks]], [m for _, m in paired[:max_chunks]]
 
 
 def _log_chunks(docs: list[str], metas: list[dict]) -> None:
@@ -221,22 +386,67 @@ def buscar_contexto(
 
     console.print("[dim]Generando variantes de búsqueda...[/dim]")
 
+    # Fragmento hipotético (HyDE): se embebe con prefijo passage: para buscar
+    # en el espacio semántico de los documentos, no en el de las preguntas.
+    # Los resultados se anteponen a los de las variantes de query normales.
+    hyde_text = _generar_hyde(pregunta_busqueda)
+    if hyde_text:
+        console.print("[dim][HyDE] Fragmento hipotético generado[/dim]")
+
     if intencion == "norma":
+        filtro = {"tipo_doc": "norma_iso"}
+        vistos: set[str] = set()
+        hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, filtro, vistos) if hyde_text else ([], [])
         variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="norma")
-        docs, metas = _ejecutar_variantes(coleccion, variantes, {"tipo_doc": "norma_iso"})
+        docs, metas = _ejecutar_variantes(coleccion, variantes, filtro, vistos=vistos)
+        docs, metas = hyde_docs + docs, hyde_metas + metas
+
+        # Fallback: si la pregunta menciona un número de cláusula, forzar su recuperación
+        clausulas_mencionadas = _RE_CLAUSULA_NORMA.findall(pregunta_busqueda)
+        if clausulas_mencionadas:
+            extra_docs, extra_metas = _forzar_clausulas_norma(
+                coleccion, clausulas_mencionadas, vistos
+            )
+            if extra_docs:
+                docs = extra_docs + docs
+                metas = extra_metas + metas
+
+        docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
         _log_chunks(docs, metas)
         return docs, metas
 
     if intencion == "interna":
+        filtro = {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
+        vistos: set[str] = set()
+        hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, filtro, vistos) if hyde_text else ([], [])
         variantes = [pregunta_busqueda] + _generar_variantes(pregunta_busqueda, orientacion="interna")
-        docs, metas = _ejecutar_variantes(
-            coleccion, variantes, {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
-        )
+        docs, metas = _ejecutar_variantes(coleccion, variantes, filtro, vistos=vistos)
+        docs, metas = hyde_docs + docs, hyde_metas + metas
+
+        # Fallback de esquemas: si la pregunta es sobre clasificación y ya recuperamos
+        # alguna sección 5.x pero faltan subsecciones, forzar su recuperación por metadata.
+        # Resuelve la brecha semántica entre terminología del usuario y vocabulario del documento.
+        if _RE_CLASIFICACION.search(pregunta_busqueda):
+            clausulas_ya = {str(m.get("clausula", "")) for m in metas}
+            fuentes_5x = [
+                m.get("fuente") for m in metas
+                if str(m.get("clausula", "")).startswith("5") and m.get("fuente")
+            ]
+            if fuentes_5x and not {"5.1", "5.2", "5.3"}.issubset(clausulas_ya):
+                fuente_cls = Counter(fuentes_5x).most_common(1)[0][0]
+                extra_docs, extra_metas = _forzar_secciones_documento(
+                    coleccion, fuente_cls,
+                    ["5", "5.1", "5.2", "5.3", "5.4", "5.5"], vistos,
+                )
+                if extra_docs:
+                    docs = extra_docs + docs
+                    metas = extra_metas + metas
+
+        docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
         _log_chunks(docs, metas)
         return docs, metas
 
     if intencion == "comparacion":
-        # Dos conjuntos independientes de variantes, sesgados a cada lado
         variantes_norma = [pregunta_busqueda] + _generar_variantes(
             pregunta_busqueda, orientacion="norma"
         )
@@ -244,52 +454,79 @@ def buscar_contexto(
             pregunta_busqueda, orientacion="interna"
         )
 
-        chunks_n, metas_n = _ejecutar_variantes(
-            coleccion, variantes_norma, {"tipo_doc": "norma_iso"}
-        )
-        chunks_i, metas_i = _ejecutar_variantes(
-            coleccion, variantes_interna, {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
-        )
+        # Lado norma: HyDE + variantes
+        filtro_n = {"tipo_doc": "norma_iso"}
+        vistos_n: set[str] = set()
+        hyde_n, hyde_metas_n = _ejecutar_hyde(coleccion, hyde_text, filtro_n, vistos_n) if hyde_text else ([], [])
+        chunks_n, metas_n = _ejecutar_variantes(coleccion, variantes_norma, filtro_n, vistos=vistos_n)
+        chunks_n, metas_n = hyde_n + chunks_n, hyde_metas_n + metas_n
+
+        # Lado interna: HyDE + variantes (vistos independiente para no contaminar cruce)
+        filtro_i = {"tipo_doc": {"$in": _TIPOS_INTERNOS}}
+        vistos_i: set[str] = set()
+        hyde_i, hyde_metas_i = _ejecutar_hyde(coleccion, hyde_text, filtro_i, vistos_i) if hyde_text else ([], [])
+        chunks_i, metas_i = _ejecutar_variantes(coleccion, variantes_interna, filtro_i, vistos=vistos_i)
+        chunks_i, metas_i = hyde_i + chunks_i, hyde_metas_i + metas_i
+
+        # Búsqueda contextual cruzada: usa el texto de los chunks norma recuperados
+        # como embedding passage para buscar el equivalente en docs internos.
+        # Cierra la brecha semántica cuando la query original es anafórica o corta
+        # y la sección interna relevante usa vocabulario distinto al de la query.
+        if chunks_n:
+            norma_ctx = " ".join(chunks_n[:2])[:800]
+            ctx_docs, ctx_metas = _ejecutar_hyde(coleccion, norma_ctx, filtro_i, vistos_i)
+            if ctx_docs:
+                chunks_i = ctx_docs + chunks_i
+                metas_i = ctx_metas + metas_i
 
         # Garantizar mínimo por cada lado aunque queden bajo el umbral
         if len(chunks_n) < N_MINIMO_POR_LADO_COMPARACION:
             fb_n, fb_metas_n = _ejecutar_variantes(
-                coleccion, variantes_norma, {"tipo_doc": "norma_iso"}, ignorar_umbral=True
+                coleccion, variantes_norma, filtro_n, ignorar_umbral=True, vistos=set(chunks_n)
             )
-            vistos_n = set(chunks_n)
             faltan = N_MINIMO_POR_LADO_COMPARACION - len(chunks_n)
+            vistos_extra = set(chunks_n)
             for c, m in zip(fb_n, fb_metas_n):
-                if c not in vistos_n and faltan > 0:
+                if c not in vistos_extra and faltan > 0:
                     chunks_n.append(c)
                     metas_n.append(m)
-                    vistos_n.add(c)
+                    vistos_extra.add(c)
                     faltan -= 1
 
         if len(chunks_i) < N_MINIMO_POR_LADO_COMPARACION:
             fb_i, fb_metas_i = _ejecutar_variantes(
-                coleccion, variantes_interna,
-                {"tipo_doc": {"$in": _TIPOS_INTERNOS}}, ignorar_umbral=True,
+                coleccion, variantes_interna, filtro_i, ignorar_umbral=True, vistos=set(chunks_i)
             )
-            vistos_i = set(chunks_i)
             faltan = N_MINIMO_POR_LADO_COMPARACION - len(chunks_i)
+            vistos_extra = set(chunks_i)
             for c, m in zip(fb_i, fb_metas_i):
-                if c not in vistos_i and faltan > 0:
+                if (
+                    c not in vistos_extra
+                    and faltan > 0
+                    and m.get("distancia", 1.0) <= _UMBRAL_FALLBACK
+                ):
                     chunks_i.append(c)
                     metas_i.append(m)
-                    vistos_i.add(c)
+                    vistos_extra.add(c)
                     faltan -= 1
 
+        chunks_n, metas_n = _recortar_contexto(chunks_n, metas_n, MAX_CONTEXT_CHUNKS_POR_LADO)
+        chunks_i, metas_i = _recortar_contexto(chunks_i, metas_i, MAX_CONTEXT_CHUNKS_POR_LADO)
         docs = chunks_n + chunks_i
         metas = metas_n + metas_i
         _log_chunks(docs, metas)
         return docs, metas
 
-    # general: sin filtro, variantes neutras + interna para ampliar cobertura semántica
+    # general: HyDE + variantes neutras + interna, sin filtro de tipo
+    vistos: set[str] = set()
+    hyde_docs, hyde_metas = _ejecutar_hyde(coleccion, hyde_text, None, vistos) if hyde_text else ([], [])
     variantes = (
         [pregunta_busqueda]
         + _generar_variantes(pregunta_busqueda, orientacion="neutra")
         + _generar_variantes(pregunta_busqueda, orientacion="interna")
     )
-    docs, metas = _ejecutar_variantes(coleccion, variantes, None)
+    docs, metas = _ejecutar_variantes(coleccion, variantes, None, vistos=vistos)
+    docs, metas = hyde_docs + docs, hyde_metas + metas
+    docs, metas = _recortar_contexto(docs, metas, MAX_CONTEXT_CHUNKS)
     _log_chunks(docs, metas)
     return docs, metas

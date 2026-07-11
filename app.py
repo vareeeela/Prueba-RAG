@@ -1,17 +1,17 @@
 import json
 import os
-import tempfile
 import uuid
 from datetime import datetime
 
 import chromadb
 import streamlit as st
 
-from src.config import RUTA_BD, md_converter
+from src.config import RUTA_BD
 from src.generator import (
-    analizar_evidencias,
     es_inyeccion_prompt,
+    extraer_metas_citadas,
     generar_respuesta,
+    reemplazar_citas,
     resumen_fuentes,
     respuesta_identidad,
 )
@@ -19,24 +19,6 @@ from src.indexer import indexar_documentos, obtener_coleccion
 from src.retriever import buscar_contexto, detectar_intencion
 
 RUTA_CONVERSACIONES = os.path.join(RUTA_BD, "conversations")
-_TIPOS_REPORTE = ["pdf", "txt", "csv", "md"]
-
-
-def extraer_texto_reporte(uploaded_file) -> str:
-    nombre = uploaded_file.name.lower()
-    if any(nombre.endswith(f".{ext}") for ext in ("txt", "csv", "md")):
-        return uploaded_file.read().decode("utf-8", errors="replace")
-    suffix = os.path.splitext(nombre)[1] or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
-    try:
-        resultado = md_converter.convert(tmp_path)
-        return resultado.text_content
-    except Exception as exc:
-        return f"[Error extrayendo texto del archivo: {exc}]"
-    finally:
-        os.remove(tmp_path)
 RUTA_INDICE = os.path.join(RUTA_BD, "conversations_index.json")
 RUTA_HISTORIAL_LEGACY = os.path.join(RUTA_BD, "historial.json")
 
@@ -66,7 +48,9 @@ def cargar_mensajes(conv_id: str) -> list[dict]:
 
 def guardar_mensajes(conv_id: str, mensajes: list[dict]) -> None:
     os.makedirs(RUTA_CONVERSACIONES, exist_ok=True)
-    with open(os.path.join(RUTA_CONVERSACIONES, f"{conv_id}.json"), "w", encoding="utf-8") as f:
+    with open(
+        os.path.join(RUTA_CONVERSACIONES, f"{conv_id}.json"), "w", encoding="utf-8"
+    ) as f:
         json.dump(mensajes, f, ensure_ascii=False, indent=2)
 
 
@@ -80,8 +64,40 @@ def crear_conversacion(titulo: str = "Nueva conversación") -> str:
     return conv_id
 
 
+def _titulo_corto(pregunta: str) -> str:
+    """Genera un título de 3-5 palabras con el modelo LLM."""
+    from src.config import GROQ_API_KEY, MODO, MODELO_GROQ, MODELO_LLM
+    prompt = (
+        "Resume en 3-5 palabras el tema de esta pregunta como título de conversación. "
+        "Solo las palabras clave, sin puntuación ni explicación.\n\n"
+        f"Pregunta: {pregunta}\nTítulo:"
+    )
+    try:
+        if MODO == "local":
+            import ollama
+            resp = ollama.chat(
+                model=MODELO_LLM,
+                messages=[{"role": "user", "content": prompt}],
+                options={"num_predict": 15},
+            )
+            titulo = resp["message"]["content"].strip()
+        else:
+            from groq import Groq
+            resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
+                model=MODELO_GROQ,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=15,
+                temperature=0.2,
+            )
+            titulo = resp.choices[0].message.content.strip()
+        titulo = titulo.strip('"\'«»').strip()
+        return titulo[:60] if titulo else pregunta[:40]
+    except Exception:
+        return pregunta[:40]
+
+
 def actualizar_titulo(conv_id: str, primera_pregunta: str) -> None:
-    titulo = primera_pregunta[:50] + ("…" if len(primera_pregunta) > 50 else "")
+    titulo = _titulo_corto(primera_pregunta)
     indice = cargar_indice()
     for conv in indice:
         if conv["id"] == conv_id:
@@ -99,7 +115,6 @@ def borrar_conversacion(conv_id: str) -> None:
 
 
 def migrar_historial_legacy() -> None:
-    """Migra historial.json antiguo a una conversación si aún no existe el índice."""
     if not os.path.exists(RUTA_HISTORIAL_LEGACY) or os.path.exists(RUTA_INDICE):
         return
     with open(RUTA_HISTORIAL_LEGACY, encoding="utf-8") as f:
@@ -109,51 +124,131 @@ def migrar_historial_legacy() -> None:
         guardar_mensajes(conv_id, mensajes)
 
 
-# ── Inicialización ─────────────────────────────────────────────────────────
-
 migrar_historial_legacy()
 
-st.set_page_config(page_title="lucIA", page_icon="👻", layout="centered")
-st.title("lucIA ฅᨐฅ")
+# ── Configuración de la página ──────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="lucIA · ISO 27001/27002",
+    page_icon="🔒",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
-/* Conversaciones de la sidebar como ítems de nav */
-section[data-testid="stSidebar"] .stButton > button {
+/* ─── Layout ─── */
+.block-container {
+    padding-top: 1.8rem !important;
+    padding-bottom: 0.5rem !important;
+    max-width: 800px !important;
+}
+
+/* ─── Sidebar oscura ─── */
+[data-testid="stSidebar"] {
+    background-color: #0f172a !important;
+}
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label {
+    color: #94a3b8 !important;
+}
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] strong {
+    color: #e2e8f0 !important;
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255,255,255,0.08) !important;
+    margin: 0.5rem 0 !important;
+}
+
+/* ─── Botones sidebar ─── */
+[data-testid="stSidebar"] .stButton > button {
     border: none !important;
     background: transparent !important;
-    text-align: start !important;
+    text-align: left !important;
     justify-content: flex-start !important;
-    padding: 0.3rem 0.5rem !important;
-    border-radius: 6px !important;
-    font-size: 0.85rem !important;
-    color: inherit !important;
-    transition: background 0.15s;
+    padding: 0.4rem 0.7rem !important;
+    border-radius: 7px !important;
+    font-size: 0.82rem !important;
+    color: #cbd5e1 !important;
+    width: 100% !important;
+    transition: background 0.1s ease;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
 }
-section[data-testid="stSidebar"] .stButton > button:hover {
-    background: rgba(128,128,128,0.12) !important;
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(255,255,255,0.07) !important;
+    color: #f1f5f9 !important;
 }
-/* Botón de nueva conversación */
-section[data-testid="stSidebar"] > div > div:first-child .stButton > button {
-    background: rgba(128,128,128,0.08) !important;
-    font-weight: 500 !important;
-    margin-block-end: 0.25rem !important;
+
+/* Botón borrar: pequeño y sutil */
+[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button {
+    color: rgba(148,163,184,0.4) !important;
+    font-size: 0.75rem !important;
+    padding: 0.35rem 0.25rem !important;
+    text-align: center !important;
+    justify-content: center !important;
 }
-/* Botón de borrar: más pequeño y sutil */
-section[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button {
-    color: rgba(128,128,128,0.6) !important;
-    font-size: 0.8rem !important;
-    padding: 0.3rem 0.2rem !important;
+[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button:hover {
+    color: #f87171 !important;
+    background: rgba(248,113,113,0.1) !important;
 }
-section[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button:hover {
-    color: #e05c5c !important;
-    background: rgba(224,92,92,0.08) !important;
+
+/* ─── Cabecera principal ─── */
+.lucia-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.1rem;
+}
+
+/* ─── Estado vacío ─── */
+.empty-state {
+    text-align: center;
+    padding: 2.5rem 1.5rem;
+    color: #94a3b8;
+    border: 1.5px dashed #e2e8f0;
+    border-radius: 14px;
+    margin: 1rem 0 1.5rem;
+}
+.empty-state .icon { font-size: 2rem; margin-bottom: 0.6rem; }
+.empty-state strong { color: #64748b; font-size: 0.95rem; display: block; margin-bottom: 0.4rem; }
+.empty-state ul {
+    list-style: none;
+    padding: 0;
+    margin: 0.8rem 0 0;
+    text-align: left;
+    display: inline-block;
+}
+.empty-state ul li {
+    font-size: 0.82rem;
+    padding: 0.25rem 0;
+    color: #94a3b8;
+}
+.empty-state ul li::before { content: "→  "; color: #cbd5e1; }
+
+/* ─── Mensajes de chat ─── */
+[data-testid="stChatMessage"] { padding: 0.6rem 0 !important; }
+
+/* ─── Fuentes ─── */
+[data-testid="stCaptionContainer"] { opacity: 0.55; font-size: 0.72rem !important; }
+
+/* ─── Input ─── */
+[data-testid="stChatInput"] textarea {
+    font-size: 0.95rem !important;
+    border-radius: 10px !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner="Cargando base de conocimiento...")
+# ── Carga del sistema ────────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner="Cargando base de conocimiento…")
 def cargar_sistema() -> chromadb.Collection:
     cliente = chromadb.PersistentClient(path=RUTA_BD)
     coleccion = obtener_coleccion(cliente)
@@ -173,15 +268,20 @@ if "conv_id" not in st.session_state:
         st.session_state.mensajes = []
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────
+# ── Sidebar ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    if st.button("＋ Nueva conversación", use_container_width=True):
+    st.markdown("### lucIA")
+    st.caption("ISO 27001 · ISO 27002")
+    st.divider()
+
+    if st.button("＋  Nueva conversación", use_container_width=True, type="secondary"):
         st.session_state.conv_id = crear_conversacion()
         st.session_state.mensajes = []
         st.rerun()
 
     st.divider()
+    st.caption("Historial")
 
     indice = cargar_indice()
     for conv in indice:
@@ -194,7 +294,7 @@ with st.sidebar:
                 st.session_state.mensajes = cargar_mensajes(conv["id"])
                 st.rerun()
         with col2:
-            if st.button("🗑", key=f"del_{conv['id']}"):
+            if st.button("✕", key=f"del_{conv['id']}"):
                 borrar_conversacion(conv["id"])
                 indice_nuevo = cargar_indice()
                 if indice_nuevo:
@@ -205,103 +305,98 @@ with st.sidebar:
                     st.session_state.mensajes = []
                 st.rerun()
 
-    st.divider()
 
+# ── Área principal ───────────────────────────────────────────────────────────
 
-# ── Tabs ───────────────────────────────────────────────────────────────────
+st.markdown("### lucIA ฅᨐฅ")
+st.caption("Asistente de seguridad de la información · ISO 27001 / ISO 27002")
 
-tab_chat, tab_evidencias = st.tabs(["💬 Chat ISO 27001/27002", "📋 Análisis de evidencias"])
-
-with tab_chat:
-    for msg in st.session_state.mensajes:
-        with st.chat_message(msg["rol"]):
-            st.write(msg["contenido"])
-            if msg.get("fuente_citada"):
-                st.caption(msg["fuente_citada"])
-
-    if pregunta := st.chat_input("Escribe tu pregunta..."):
-        with st.chat_message("user"):
-            st.write(pregunta)
-
-        historial_previo = st.session_state.mensajes.copy()
-
-        if not historial_previo:
-            actualizar_titulo(st.session_state.conv_id, pregunta)
-
-        st.session_state.mensajes.append({"rol": "user", "contenido": pregunta})
-
-        fuente_citada = ""
-        with st.chat_message("assistant"):
-            resp_fija = respuesta_identidad(pregunta)
-            if resp_fija:
-                respuesta = resp_fija
-                st.markdown(respuesta)
-            elif es_inyeccion_prompt(pregunta):
-                respuesta = (
-                    "Esta solicitud parece intentar modificar mi comportamiento o rol. "
-                    "Solo puedo responder preguntas sobre los documentos disponibles."
-                )
-                st.write(respuesta)
-            else:
-                intencion = detectar_intencion(pregunta)
-                with st.spinner("Buscando en documentación..."):
-                    chunks, metas = buscar_contexto(coleccion, pregunta, historial=historial_previo, intencion=intencion)
-
-                if not chunks:
-                    respuesta = "Esta consulta no está cubierta por los documentos disponibles."
-                    st.write(respuesta)
-                else:
-                    placeholder = st.empty()
-                    respuesta = ""
-                    for token in generar_respuesta(chunks, metas, pregunta, historial=historial_previo, intencion=intencion):
-                        respuesta += token
-                        placeholder.markdown(respuesta)
-                    fuente_citada = resumen_fuentes(metas)
-                    if fuente_citada:
-                        st.caption(fuente_citada)
-
-        st.session_state.mensajes.append({
-            "rol": "assistant",
-            "contenido": respuesta,
-            "fuente_citada": fuente_citada,
-        })
-        guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)
-        st.rerun()
-
-
-with tab_evidencias:
-    st.caption(
-        "Sube un reporte de evidencias operativas (Tenable, Scorecard, Nessus…) "
-        "para obtener un listado enumerado y conciso de los hallazgos."
+if not st.session_state.mensajes:
+    st.markdown(
+        "<div class='empty-state'>"
+        "<div class='icon'>🔒</div>"
+        "<strong>¿En qué puedo ayudarte?</strong>"
+        "Consulta normas, controles o análisis de cumplimiento."
+        "<ul>"
+        "<li>¿Qué establece el control 8.8 sobre vulnerabilidades técnicas?</li>"
+        "<li>¿Cuáles son los requisitos del Anexo A de la ISO 27001?</li>"
+        "<li>¿Cumple nuestra política de acceso con la ISO 27002?</li>"
+        "<li>Explícame los controles de gestión de activos</li>"
+        "</ul>"
+        "</div>",
+        unsafe_allow_html=True,
     )
 
-    archivo = st.file_uploader("Cargar reporte", type=_TIPOS_REPORTE)
-    consulta_adicional = st.text_input(
-        "Pregunta adicional (opcional)",
-        placeholder="p. ej. ¿cuántas vulnerabilidades críticas hay?",
-    )
+# Renderizar mensajes anteriores desde el estado de sesión
+for msg in st.session_state.mensajes:
+    with st.chat_message(msg["rol"]):
+        st.markdown(msg["contenido"])
+        if msg.get("fuente_citada"):
+            st.caption(msg["fuente_citada"])
 
-    col_analizar, col_limpiar = st.columns([3, 1])
-    with col_analizar:
-        analizar = st.button("Analizar reporte", type="primary", disabled=archivo is None)
-    with col_limpiar:
-        if st.button("Limpiar resultado"):
-            st.session_state.pop("evidencias_resultado", None)
-            st.rerun()
+# ── Procesamiento de la pregunta ─────────────────────────────────────────────
 
-    if analizar and archivo:
-        with st.spinner("Extrayendo texto del reporte..."):
-            texto_reporte = extraer_texto_reporte(archivo)
+if pregunta := st.chat_input("Escribe tu pregunta sobre ISO 27001/27002…"):
+    historial_previo = st.session_state.mensajes.copy()
+    primera_pregunta = not historial_previo
 
-        if texto_reporte.startswith("[Error"):
-            st.error(texto_reporte)
+    # Mostrar el mensaje del usuario inmediatamente
+    with st.chat_message("user"):
+        st.markdown(pregunta)
+
+    # Procesar y mostrar la respuesta del asistente
+    fuente_citada = ""
+    respuesta_display = ""
+    with st.chat_message("assistant"):
+        resp_fija = respuesta_identidad(pregunta)
+        if resp_fija:
+            respuesta = resp_fija
+            respuesta_display = respuesta
+            st.markdown(respuesta)
+        elif es_inyeccion_prompt(pregunta):
+            respuesta = (
+                "Esta solicitud parece intentar modificar mi comportamiento o rol. "
+                "Solo puedo responder preguntas sobre los documentos disponibles."
+            )
+            respuesta_display = respuesta
+            st.warning(respuesta)
         else:
-            ev_placeholder = st.empty()
-            ev_resultado = ""
-            for token in analizar_evidencias(texto_reporte, consulta_adicional):
-                ev_resultado += token
-                ev_placeholder.markdown(ev_resultado)
-            st.session_state.evidencias_resultado = ev_resultado
+            intencion = detectar_intencion(pregunta)
+            with st.spinner("Buscando en la documentación…"):
+                chunks, metas = buscar_contexto(
+                    coleccion, pregunta, historial=historial_previo, intencion=intencion,
+                )
 
-    elif st.session_state.get("evidencias_resultado"):
-        st.markdown(st.session_state.evidencias_resultado)
+            if not chunks:
+                respuesta = "Esta consulta no está cubierta por los documentos disponibles."
+                respuesta_display = respuesta
+                st.info(respuesta)
+            else:
+                placeholder = st.empty()
+                respuesta = ""
+                for token in generar_respuesta(
+                    chunks, metas, pregunta,
+                    historial=historial_previo, intencion=intencion,
+                ):
+                    respuesta += token
+                    placeholder.markdown(respuesta + "▌")
+                respuesta_display = reemplazar_citas(respuesta, metas)
+                placeholder.markdown(respuesta_display)
+                metas_citadas = extraer_metas_citadas(respuesta, metas, intencion)
+                fuente_citada = resumen_fuentes(metas_citadas)
+                if fuente_citada:
+                    st.caption(fuente_citada)
+
+    # Guardar en estado de sesión y en disco
+    st.session_state.mensajes.append({"rol": "user", "contenido": pregunta})
+    st.session_state.mensajes.append({
+        "rol": "assistant",
+        "contenido": respuesta_display,
+        "fuente_citada": fuente_citada,
+    })
+    guardar_mensajes(st.session_state.conv_id, st.session_state.mensajes)
+
+    # Solo rerun en la primera pregunta para actualizar el título en la sidebar
+    if primera_pregunta:
+        actualizar_titulo(st.session_state.conv_id, pregunta)
+        st.rerun()
